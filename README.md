@@ -53,6 +53,7 @@ A GitHub Action that looks after the issues of a repository. Each line leads to 
 - <a name="slash-commands"></a>**[Slash commands](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/slash-commands.md):** steer the assistant from the issue, such as `/assistant again` or `/assistant ask <question>`.
 - <a name="from-the-fix-to-the-release"></a>**[From the fix to the release](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/fix-to-release.md):** a fixed issue stays open until a release ships the fix, then closes with a link to it.
 - <a name="what-the-ai-reads"></a>**[What the AI reads](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/what-the-ai-reads.md):** each task reads what it needs and no more, and a first analysis learns from the maintainers' corrections.
+- **[Saying no to the AI](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/opt-out.md):** a box in the issue form keeps the AI out of an issue, and all that runs without AI goes on.
 - <a name="languages"></a>**[Languages](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/languages.md):** fourteen catalogs for the reporters, and a folded summary for maintainers who don't read their language.
 - <a name="limits-of-the-ai-runs"></a>**[Limits of the AI runs](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/limits.md):** no stranger can run up the bill: the runs that others than the maintainers start are limited.
 - <a name="what-one-run-may-cost"></a>**[What one run may cost](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/cost.md):** each run stops at its turns and its dollars, and the summary of its job says what it cost.
@@ -65,7 +66,7 @@ The maintainer reads every issue and has the last word. A first analysis looks l
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Dennis-Otto/issue-assistant/main/docs/images/analysis-dark.webp">
-  <img src="https://raw.githubusercontent.com/Dennis-Otto/issue-assistant/main/docs/images/analysis-light.webp" alt="A first analysis of the issue assistant on an issue of a demo project: thanks to the reporter, a summary, the first analysis with the likely cause, what is worth trying, the information needed with the reminder after 15 days, a related issue, links to the line of code and the section of the troubleshooting guide, and a footer that names Claude and the label it added, links how the assistant works and asks for a thumbs up or down">
+  <img src="https://raw.githubusercontent.com/Dennis-Otto/issue-assistant/main/docs/images/analysis-light.webp" alt="A first analysis of the issue assistant on an issue of a demo project: thanks to the reporter, a summary, the first analysis with the likely cause, what is worth trying, the information needed with the reminder after 15 days, a related issue, links to the line of code and the section of the troubleshooting guide, and a footer that names Claude and the label it added, links how the assistant works, asks for a thumbs up or down and links the project">
 </picture>
 
 **Used by** [HomeDarts for Autodarts](https://github.com/Dennis-Otto/homedarts-for-autodarts), [Player Switch for Autodarts](https://github.com/Dennis-Otto/player-switch-for-autodarts), [Paperless Unified Search](https://github.com/Dennis-Otto/paperless-unified-search), [Paperless Sync](https://github.com/Dennis-Otto/paperless-sync), the [repository blueprint](https://github.com/Dennis-Otto/repo-blueprint), the website [dennis-otto.github.io](https://github.com/Dennis-Otto/dennis-otto.github.io) and the issue assistant itself.
@@ -121,6 +122,16 @@ The [website](https://dennis-otto.github.io/issue-assistant/) has all of this on
 - **[Roadmap](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/roadmap.md)** and **[changelog](https://github.com/Dennis-Otto/issue-assistant/blob/main/CHANGELOG.md):** what comes next, and what each release changed.
 
 <sub>💛 If the issue assistant is useful to you, you can [support its development](https://github.com/sponsors/Dennis-Otto).</sub>
+
+## Show that you use it
+
+The footer of every comment of the AI already links the issue assistant, unless `[transparency] credit = false` in `.github/issue-assistant/config.toml` leaves that out. A badge in your README tells people before they open an issue, and helps others find the tool:
+
+[![issues: triaged by issue assistant](https://img.shields.io/badge/issues-triaged%20by%20issue%20assistant-blue)](https://dennis-otto.github.io/issue-assistant/)
+
+```markdown
+[![issues: triaged by issue assistant](https://img.shields.io/badge/issues-triaged%20by%20issue%20assistant-blue)](https://dennis-otto.github.io/issue-assistant/)
+```
 
 ## Development
 

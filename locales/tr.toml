@@ -91,6 +91,7 @@ footer = """\
   {feedback}</sub>"""
 labels = " Etiketler: {labels}."
 about = "[Asistan nasıl çalışır]({notice})"
+credit = "[konu asistanı]({project})"
 feedback = """\
   Bu yoruma vereceğiniz 👍 veya 👎, bakımcılara işe yarayıp yaramadığını söyler."""
 "feedback.duplicate" = """\
@@ -145,6 +146,7 @@ reminder = """\
   kapatıldı. Lütfen orada devam edin; #{number} numaralı konuya verilen bir 👍, daha \
   fazla kişinin etkilendiğini gösterir. Bu bir hataysa bir yorum yazın, bakımcılar \
   konuyu yeniden açar."""
+"let-in" = "Teşekkürler @{author}: istediğin gibi yapay zekâ artık bu konuyu okuyabilir, analizi birazdan gelecek. Bunu konu başına bir kez isteyebilirsin."
 reopened = """\
   Yanıtınız için teşekkürler, @{author}! Konuyu yeniden açtım; bakımcılar bir kez \
   daha bakacak."""

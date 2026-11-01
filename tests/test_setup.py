@@ -31,6 +31,7 @@ def test_the_settings_are_read_with_defaults(config, root):
     assert config.engine == "claude" and config.model == ""
     assert config.hosts == {"www.home-assistant.io", "docs.autodarts.io"}
     assert config.area_field == "Area" and config.unmapped_options == ("Other",)
+    assert config.opt_out_field == "Automated analysis"
     assert config.notices == ("SUPPORT.md",)
     assert config.asking_kinds() == {"bug", "question", "documentation"}
     assert config.blob == "https://github.com/owner/project/blob"
@@ -131,13 +132,16 @@ LABEL = (
         (
             CONFIG,
             '[links]\nhosts = "docs.example.com"\n\n[forms]\narea_field = 3\n'
-            'unmapped_options = ["Other", 1]\n\n[transparency]\nfiles = "SUPPORT.md"\n'
-            '\n[releases]\nclose_with_release = "no"\n',
+            'unmapped_options = ["Other", 1]\nopt_out_field = 3\n\n'
+            '[transparency]\nfiles = "SUPPORT.md"\n'
+            'credit = "no"\n\n[releases]\nclose_with_release = "no"\n',
             [
                 f"{CONFIG}: [links] hosts must be a list of strings",
                 f"{CONFIG}: [forms] area_field must be a string",
                 f"{CONFIG}: [forms] unmapped_options must be a list of strings",
+                f"{CONFIG}: [forms] opt_out_field must be a string",
                 f"{CONFIG}: [transparency] files must be a list of strings",
+                f"{CONFIG}: [transparency] credit must be true or false",
                 f"{CONFIG}: [releases] close_with_release must be true or false",
             ],
         ),
@@ -383,8 +387,13 @@ def test_install_needs_a_commit_hash(tmp_path):
 
 
 def test_the_starter_files_make_a_valid_set_up(tmp_path):
-    done = assistant.install(tmp_path, REF, "v1.0.0")
+    done = assistant.install(tmp_path, REF, "v1.0.0", REPOSITORY)
     assert "wrote .github/ISSUE_TEMPLATE/bug_report.yml; adapt it" in done
+    assert "wrote .github/ISSUE_TEMPLATE/feature_request.yml; adapt it" in done
+    assert (
+        "wrote .github/ISSUE_TEMPLATE/config.yml; adapt it, and turn on what its links "
+        "need on GitHub"
+    ) in done
     assert "added what happens with an issue to SUPPORT.md; adapt it" in done
     project = tmp_path / assistant.SETTINGS / "project.md"
     config = assistant.load_config(tmp_path, REPOSITORY, lenient=True)
@@ -536,24 +545,208 @@ def test_install_without_a_checkout_of_its_own_takes_what_it_is_given(
 # The starters of a set-up
 
 
-def test_install_writes_a_bug_report_form_only_without_forms(tmp_path):
-    starter = assistant.TEMPLATES / assistant.FORM_STARTER
-    form = tmp_path / ".github/ISSUE_TEMPLATE/bug_report.yml"
-    assert assistant.add_form(tmp_path, starter_labels=True) == [
-        "wrote .github/ISSUE_TEMPLATE/bug_report.yml; adapt it"
+def add_forms(root):
+    return assistant.add_forms(root, REPOSITORY, starter_labels=True)
+
+
+def test_install_writes_the_forms_and_their_chooser_only_without_forms(tmp_path):
+    assistant.install(tmp_path, REF, "v1.0.0", REPOSITORY)
+    forms = tmp_path / assistant.FORMS
+    assert sorted(path.name for path in forms.iterdir()) == [
+        "bug_report.yml",
+        "config.yml",
+        "feature_request.yml",
     ]
-    assert form.read_bytes() == starter.read_bytes()
-    assert assistant.add_form(tmp_path, starter_labels=True) == []
-    # The settings of the chooser are no form; a template in Markdown is one.
-    form.unlink()
-    (tmp_path / ".github/ISSUE_TEMPLATE/config.yml").write_text(
-        "blank_issues_enabled: false\n", encoding="utf-8"
-    )
-    assert assistant.add_form(tmp_path, starter_labels=True) != []
-    form.unlink()
-    (tmp_path / ".github/ISSUE_TEMPLATE/bug.md").write_text("A bug\n", "utf-8")
-    assert assistant.add_form(tmp_path, starter_labels=True) == []
-    assert not form.exists()
+    for starter in assistant.FORM_STARTERS.values():
+        written = tmp_path / starter
+        assert written.read_bytes() == (assistant.TEMPLATES / starter).read_bytes()
+    # A repository with forms gets nothing new, not even a chooser that it lacks.
+    chooser = forms / "config.yml"
+    chooser.unlink()
+    assert add_forms(tmp_path) == []
+    assert not chooser.exists()
+    # The settings of the chooser are no form, and stay what they are.
+    for starter in assistant.FORM_STARTERS.values():
+        (tmp_path / starter).unlink()
+    chooser.write_text("blank_issues_enabled: true\n", encoding="utf-8")
+    assert add_forms(tmp_path) == [
+        "wrote .github/ISSUE_TEMPLATE/bug_report.yml; adapt it",
+        "wrote .github/ISSUE_TEMPLATE/feature_request.yml; adapt it",
+    ]
+    assert chooser.read_text("utf-8") == "blank_issues_enabled: true\n"
+    # So does one under the other name of a YAML file.
+    for starter in assistant.FORM_STARTERS.values():
+        (tmp_path / starter).unlink()
+    chooser.rename(forms / "config.yaml")
+    assert len(add_forms(tmp_path)) == 2
+    assert not chooser.exists()
+    # A template in Markdown is a form.
+    for starter in assistant.FORM_STARTERS.values():
+        (tmp_path / starter).unlink()
+    (forms / "bug.md").write_text("A bug\n", "utf-8")
+    assert add_forms(tmp_path) == []
+    assert sorted(path.name for path in forms.iterdir()) == ["bug.md", "config.yaml"]
+
+
+@pytest.mark.parametrize(
+    ("settings", "links"),
+    [
+        (
+            None,
+            [
+                "discussions/categories/q-a",
+                "security/advisories/new",
+                "blob/HEAD/SUPPORT.md#what-happens-with-your-issue",
+            ],
+        ),
+        (
+            '[discussions]\nanswer_categories = ["Help & Support", "Q&A"]\n'
+            '[transparency]\nfiles = ["docs/help me.md"]\n',
+            [
+                "discussions/categories/help-support",
+                "security/advisories/new",
+                "blob/HEAD/docs/help%20me.md#what-happens-with-your-issue",
+            ],
+        ),
+        (
+            "[discussions]\nanswer_categories = []\n[transparency]\nfiles = []\n",
+            ["security/advisories/new"],
+        ),
+    ],
+    ids=["starter", "own settings", "no categories and no notice"],
+)
+def test_the_chooser_links_what_the_repository_has(tmp_path, settings, links):
+    if settings:
+        file = tmp_path / assistant.SETTINGS / "config.toml"
+        file.parent.mkdir(parents=True)
+        file.write_text(settings, encoding="utf-8")
+    assistant.install(tmp_path, REF, "v1.0.0", REPOSITORY)
+    chooser = assistant.load_yaml(tmp_path / assistant.CHOOSER)
+    assert chooser["blank_issues_enabled"] is False
+    assert [link["url"] for link in chooser["contact_links"]] == [
+        f"https://github.com/{REPOSITORY}/{link}" for link in links
+    ]
+    # Nothing of the template is left, in the links or around them.
+    text = (tmp_path / assistant.CHOOSER).read_text("utf-8")
+    for placeholder in ("OWNER/NAME", "CATEGORY", "NOTICE_LINK"):
+        assert placeholder not in text
+
+
+def test_check_asks_for_the_repository_in_the_links_of_the_chooser(tmp_path):
+    # Without a remote on GitHub, nobody knows the repository yet.
+    done = assistant.install(tmp_path, REF, "v1.0.0")
+    assert (
+        "wrote .github/ISSUE_TEMPLATE/config.yml; replace OWNER/NAME in its links with "
+        "the repository, which neither GH_REPO nor the remote origin names, or run "
+        "install again once the remote does"
+    ) in done
+    chooser = tmp_path / assistant.CHOOSER
+    text = chooser.read_text("utf-8")
+    assert "https://github.com/OWNER/NAME/security/advisories/new" in text
+    assert "https://github.com/OWNER/NAME/blob/HEAD/SUPPORT.md" in text
+    config = assistant.load_config(tmp_path, REPOSITORY, lenient=True)
+    assert assistant.check_forms(config) == [
+        ".github/ISSUE_TEMPLATE/config.yml: replace OWNER/NAME in its links with the "
+        "owner and name of the repository; install does it where the remote origin "
+        "names the repository"
+    ]
+    chooser.write_text(text.replace("OWNER/NAME", REPOSITORY), encoding="utf-8")
+    assert assistant.check_forms(config) == []
+
+
+@pytest.mark.parametrize("name", ["config.yml", "config.yaml"])
+def test_install_again_names_the_repository_in_the_chooser(tmp_path, name):
+    # The forms are there by then, and the chooser would keep its placeholder forever.
+    assistant.install(tmp_path, REF, "v1.0.0")
+    chooser = tmp_path / assistant.CHOOSER
+    chooser = chooser.rename(chooser.with_name(name))
+    # What the maintainer wrote around it stays, byte by byte.
+    before = chooser.read_bytes().replace(b"\n", b"\r\n")
+    chooser.write_bytes(before)
+    done = assistant.install(tmp_path, REF, "v1.0.0")
+    assert not any(line.startswith("named") for line in done)
+    assert chooser.read_bytes() == before
+    done = assistant.install(tmp_path, REF, "v1.0.0", REPOSITORY)
+    where = f".github/ISSUE_TEMPLATE/{name}"
+    assert f"named {REPOSITORY} in the links of {where}" in done
+    assert chooser.read_bytes() == before.replace(b"OWNER/NAME", REPOSITORY.encode())
+    config = assistant.load_config(tmp_path, REPOSITORY, lenient=True)
+    assert assistant.check_forms(config) == []
+    # Once it is named, there is nothing left to do.
+    done = assistant.install(tmp_path, REF, "v1.0.0", REPOSITORY)
+    assert not any(line.startswith("named") for line in done)
+
+
+def test_install_names_the_repository_in_a_chooser_without_forms(tmp_path):
+    # Own labels hold back the forms, and the chooser still gets its name.
+    labels = tmp_path / ".github/labels.toml"
+    labels.parent.mkdir(parents=True)
+    labels.write_text('[[label]]\nname = "defect"\ncolor = "d73a4a"\n', "utf-8")
+    chooser = tmp_path / assistant.CHOOSER
+    chooser.parent.mkdir(parents=True)
+    chooser.write_text("url: https://github.com/OWNER/NAME/issues\n", "utf-8")
+    done = assistant.install(tmp_path, REF, "v1.0.0", REPOSITORY)
+    named = f"named {REPOSITORY} in the links of .github/ISSUE_TEMPLATE/config.yml"
+    assert named in done
+    assert any(line.startswith("wrote no issue forms") for line in done)
+    text = chooser.read_text("utf-8")
+    assert text == f"url: https://github.com/{REPOSITORY}/issues\n"
+
+
+def test_a_chooser_that_is_no_yaml_is_named(config, root):
+    # GitHub ignores it without a word, and shows blank issues again.
+    (root / assistant.CHOOSER).write_text("contact_links: [\n", "utf-8")
+    (problem,) = assistant.check_forms(config)
+    assert problem.startswith(".github/ISSUE_TEMPLATE/config.yml is no valid YAML: ")
+
+
+@pytest.mark.parametrize(
+    ("remote", "repository"),
+    [
+        ("https://github.com/owner/project.git", "owner/project"),
+        ("https://github.com/owner/project", "owner/project"),
+        ("https://github.com/owner/project.js/", "owner/project.js"),
+        ("https://token@github.com/owner/project.git", "owner/project"),
+        ("git@github.com:owner/project.git", "owner/project"),
+        ("ssh://git@github.com/owner/project.git", "owner/project"),
+        ("https://gitlab.com/owner/project.git", ""),
+        ("https://github.com.example.com/owner/project", ""),
+        ("https://github.com/owner/project/more", ""),
+        ("../project", ""),
+    ],
+)
+def test_install_reads_the_repository_of_the_remote(tmp_path, remote, repository):
+    run_git(tmp_path, "init", "-q", "--template=", "-b", "main")
+    assert assistant.repository_of_remote(tmp_path) == ""
+    run_git(tmp_path, "remote", "add", "origin", remote)
+    assert assistant.repository_of_remote(tmp_path) == repository
+
+
+@pytest.mark.parametrize(
+    ("env", "named"),
+    [
+        ({"GH_REPO": "", "GITHUB_REPOSITORY": ""}, "owner/remote"),
+        ({"GH_REPO": "owner/given"}, "owner/given"),
+        ({"GH_REPO": "", "GITHUB_REPOSITORY": "owner/run"}, "owner/run"),
+        # gh takes [HOST/]OWNER/REPO, and install without --setup calls no GitHub.
+        ({"GH_REPO": "github.com/owner/given"}, "owner/remote"),
+    ],
+    ids=["remote", "GH_REPO", "GITHUB_REPOSITORY", "GH_REPO with a host"],
+)
+def test_the_install_command_names_the_repository_in_the_chooser(
+    monkeypatch, tmp_path, capsys, env, named
+):
+    package = tmp_path / "package"
+    package.mkdir()
+    monkeypatch.setattr(assistant, "TOOL", package)
+    monkeypatch.setattr(assistant, "repository_of_remote", lambda root: "owner/remote")
+    target = tmp_path / "target"
+    target.mkdir()
+    argv = ("install", "--ref", REF, "--version", "v1.2.3")
+    code, _, _ = run_main(monkeypatch, tmp_path, target, None, *argv, **env)
+    assert code == 0, capsys.readouterr().out
+    chooser = (target / assistant.CHOOSER).read_text("utf-8")
+    assert f"https://github.com/{named}/security/advisories/new" in chooser
 
 
 def test_install_writes_the_form_only_with_the_starter_labels(tmp_path):
@@ -563,10 +756,10 @@ def test_install_writes_the_form_only_with_the_starter_labels(tmp_path):
     labels.parent.mkdir(parents=True)
     labels.write_text('[[label]]\nname = "defect"\ncolor = "d73a4a"\n', "utf-8")
     done = assistant.install(tmp_path, REF, "v1.0.0")
-    starter = (assistant.TEMPLATES / assistant.FORM_STARTER).as_posix()
+    starters = (assistant.TEMPLATES / assistant.FORMS).as_posix()
     assert (
-        "wrote no issue form for your own .github/labels.toml; the starter "
-        f"{starter} needs its labels and areas there"
+        "wrote no issue forms for your own .github/labels.toml; the starters in "
+        f"{starters} need its labels and areas there"
     ) in done
     assert not (tmp_path / ".github/ISSUE_TEMPLATE").exists()
     assert labels.read_text("utf-8").startswith('[[label]]\nname = "defect"')
@@ -577,8 +770,12 @@ def test_install_writes_the_form_only_with_the_starter_labels(tmp_path):
     assert "wrote .github/ISSUE_TEMPLATE/bug_report.yml; adapt it" in done
 
 
-def test_the_starter_form_chooses_the_starter_area_labels():
-    form = assistant.load_yaml(assistant.TEMPLATES / assistant.FORM_STARTER)
+@pytest.mark.parametrize(
+    ("kind", "label"), [("bug", "bug"), ("feature", "enhancement")]
+)
+def test_the_starter_forms_choose_the_starter_area_labels(kind, label):
+    form = assistant.load_yaml(assistant.TEMPLATES / assistant.FORM_STARTERS[kind])
+    assert form["labels"] == [label, assistant.NEEDS_TRIAGE]
     labels = assistant.load_labels(
         assistant.TEMPLATES / assistant.LABELS_FILE, assistant.Problems()
     )
@@ -591,6 +788,29 @@ def test_the_starter_form_chooses_the_starter_area_labels():
     # It tells reporters that an AI answers first, and where they read more.
     intro = form["body"][0]["attributes"]["value"]
     assert "AI issue assistant" in intro and "SUPPORT.md" in intro
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        path
+        for path in sorted((assistant.TEMPLATES / assistant.FORMS).glob("*.yml"))
+        if path.stem != "config"
+    ],
+    ids=lambda path: path.stem,
+)
+def test_each_starter_form_offers_the_box_unticked_with_a_link_to_the_notice(path):
+    form = assistant.load_yaml(path)
+    (box,) = [
+        item
+        for item in form["body"]
+        if (item.get("attributes") or {}).get("label") == assistant.Config.opt_out_field
+    ]
+    assert box["type"] == "checkboxes"
+    assert form["body"][-1] is box
+    (option,) = box["attributes"]["options"]
+    assert "AI" in option["label"] and not option.get("required")
+    assert assistant.NOTICE_ANCHOR in box["attributes"]["description"]
 
 
 def test_install_tells_reporters_what_happens_with_their_issue(tmp_path, root):
@@ -1168,6 +1388,50 @@ def test_form_problems_are_found(config, root):
         ".github/labels.toml: the form option 'Live card' belongs to area: cards, area: more",
         ".github/labels.toml: no label has the form option 'Online'",
         ".github/labels.toml: area: games names the option 'X01 game', which no form has",
+    ]
+
+
+FORM = ".github/ISSUE_TEMPLATE/bug_report.yml"
+BOX_FIELD = "the field 'Automated analysis' of [forms] opt_out_field"
+
+
+@pytest.mark.parametrize(
+    ("field", "problem"),
+    [
+        (
+            "  - type: checkboxes\n    attributes:\n      label: Automated analysis\n"
+            "      options:\n        - label: No AI\n",
+            None,
+        ),
+        (
+            "  - type: textarea\n    attributes:\n      label: Automated analysis\n",
+            f"{FORM}: {BOX_FIELD} must be checkboxes with one box",
+        ),
+        (
+            "  - type: checkboxes\n    attributes:\n      label: Automated analysis\n"
+            "      options:\n        - label: No AI\n        - label: No bots\n",
+            f"{FORM}: {BOX_FIELD} must be checkboxes with one box",
+        ),
+        (
+            "  - type: checkboxes\n    attributes:\n      label: Automated analysis\n"
+            "      options:\n        - label: No AI\n          required: true\n",
+            f"{FORM}: {BOX_FIELD} must not be required, or every reporter would opt out",
+        ),
+    ],
+)
+def test_check_validates_the_box_of_the_forms(config, root, field, problem):
+    form = root / FORM
+    form.write_text(form.read_text("utf-8") + field, encoding="utf-8")
+    assert assistant.check_forms(config) == ([problem] if problem else [])
+
+
+def test_check_names_a_box_of_its_own_name_that_no_form_has(config):
+    # The default name without a box: this repository offers no opt-out.
+    assert assistant.check_forms(config) == []
+    named = dataclasses.replace(config, opt_out_field="No AI")
+    assert assistant.check_forms(named) == [
+        ".github/issue-assistant/config.toml: [forms] opt_out_field names 'No AI', "
+        "which no form has"
     ]
 
 
@@ -1833,7 +2097,12 @@ def test_the_tool_files_are_where_the_action_expects_them():
     assert (assistant.TEMPLATES / assistant.FIREWALL).is_file()
     # The catalog of every language of the comments, English first of all.
     assert (tool / "locales" / "en.toml").is_file()
-    for name in (assistant.FORM_STARTER, assistant.NOTICE, assistant.NOTICE_DE):
+    for name in (
+        *assistant.FORM_STARTERS.values(),
+        assistant.CHOOSER,
+        assistant.NOTICE,
+        assistant.NOTICE_DE,
+    ):
         assert (assistant.TEMPLATES / name).is_file()
     # The version of the release, for the command that check names.
     assert tool / "version.txt" == assistant.VERSION_FILE

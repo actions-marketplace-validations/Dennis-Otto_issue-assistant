@@ -68,9 +68,11 @@ hosts = ["docs.example.com"]    # besides this repository
 [forms]
 area_field = "Area"
 unmapped_options = ["Other"]
+opt_out_field = "Automated analysis"   # the box with which a reporter keeps the AI out of their issue
 
 [transparency]
 files = ["SUPPORT.md"]
+credit = true                   # false: the footers of the AI's comments don't link the project
 
 [releases]
 close_with_release = true       # false: fixed issues don't wait for a release

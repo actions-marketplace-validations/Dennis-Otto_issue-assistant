@@ -71,10 +71,16 @@ STARTERS = (
     SETTINGS / "config.toml",
     FINDINGS_FILE,
 )
-# The issue forms and templates of a repository, and the form that install writes
-# into a repository that has none.
+# The issue forms and templates of a repository, the forms that install writes into
+# a repository that has none, by the kind of issue that each opens, and the chooser
+# that it writes with them, which holds this name until someone names the repository.
 FORMS = PurePosixPath(".github/ISSUE_TEMPLATE")
-FORM_STARTER = FORMS / "bug_report.yml"
+FORM_STARTERS = {
+    "bug": FORMS / "bug_report.yml",
+    "feature": FORMS / "feature_request.yml",
+}
+CHOOSER = FORMS / "config.yml"
+CHOOSER_REPOSITORY = "OWNER/NAME"
 # The section that tells reporters what happens with their issue, which install adds
 # to each file of [transparency] that doesn't name the engine yet, in English or, for
 # a file such as SUPPORT.de.md, in German.
@@ -132,6 +138,8 @@ DISCUSSION_WORKFLOW = "discussion-assistant.yml"
 # The reasons GitHub accepts for dismissing a code scanning alert.
 DISMISS_REASONS = ("false positive", "won't fix", "used in tests")
 ACTION = "Dennis-Otto/issue-assistant"
+# Where a reader of a comment finds the tool that wrote it; see invitation.
+PROJECT = f"https://github.com/{ACTION}"
 REUSABLE_PREFIX = "reusable-"
 # A pin of the issue assistant in a template: of one of its reusable workflows, or
 # of the action itself.
@@ -144,6 +152,11 @@ CLONE = f"git clone --depth 1 --branch vX.Y.Z https://github.com/{ACTION}"
 # A repository as owner/name, in the characters GitHub allows; "." and ".." are no
 # names.
 REPOSITORY_NAME = re.compile(r"[\w-]+/(?!\.\.?\Z)[\w.-]+", re.ASCII)
+# A remote of a checkout on GitHub, over HTTPS or SSH.
+GITHUB_REMOTE = re.compile(
+    r"(?:https://(?:[^/@]+@)?github\.com/|(?:ssh://)?git@github\.com[:/])"
+    r"(?P<name>\S+?)(?:\.git)?/?"
+)
 
 BOT = "github-actions[bot]"
 MAINTAINERS = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -317,6 +330,9 @@ PINNED = "pinned"
 # The kind of the marker of the issue that keeps the digest of the sweep; see
 # keep_digest_issue.
 DIGEST = "digest"
+# The marker of the comment with which a reporter's /assistant again ends the mute of
+# the box of the form on an issue without an analysis.
+LET_IN = "let-in"
 DIGEST_TITLE = "Triage digest"
 # The longest title of an issue that GitHub takes.
 MAX_TITLE = 256
@@ -465,6 +481,8 @@ HTML_TAG = re.compile(rf"{TAG}|(?P<open></?[A-Za-z][^>\n]*)")
 # A heading of an issue form: GitHub writes the label of each field as `### Label`
 # above its answer.
 FORM_HEADING = re.compile(r"^###[ \t]+(.*)$", re.MULTILINE)
+# A ticked box of a form, as GitHub writes it into the text of the issue.
+TICKED_BOX = re.compile(r"^[ \t]*[-*][ \t]+\[[xX]\]", re.MULTILINE)
 # The marks of a heading, without the line break after them.
 HEADING_LINE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)", re.MULTILINE)
 SECRET = re.compile(
@@ -1229,7 +1247,11 @@ class Config:
     hosts: frozenset[str] = frozenset()
     area_field: str = "Area"
     unmapped_options: tuple[str, ...] = ("Other",)
+    # The box of the forms that keeps the AI out of an issue; see box_ticked.
+    opt_out_field: str = "Automated analysis"
     notices: tuple[str, ...] = ("SUPPORT.md",)
+    # Whether the footers of the AI's comments link the project; see invitation.
+    credit: bool = True
     # Whether a fixed issue stays open until a release ships the fix.
     releases: bool = True
     # The limits of the AI runs; see LIMITS.
@@ -1339,8 +1361,12 @@ CONFIG_KEYS: dict[str, dict[str, Key]] = {
     "forms": {
         "area_field": Key("area_field", str),
         "unmapped_options": Key("unmapped_options", list, tuple),
+        "opt_out_field": Key("opt_out_field", str),
     },
-    "transparency": {"files": Key("notices", list, tuple)},
+    "transparency": {
+        "files": Key("notices", list, tuple),
+        "credit": Key("credit", bool),
+    },
     "releases": {"close_with_release": Key("releases", bool)},
     # The attributes of Config.lifecycle.
     "lifecycle": {
@@ -3143,6 +3169,33 @@ def form_labels(issue: dict[str, Any], config: Config) -> list[str]:
     return [label.name for label in config.labels if answers & set(label.form_options)]
 
 
+def box_ticked(body: str | None, config: Config) -> bool:
+    """Whether the text of an issue has the box of [forms] opt_out_field ticked, with
+    which its reporter keeps the AI out of it."""
+    answer = form_fields(body or "").get(config.opt_out_field, "")
+    return TICKED_BOX.search(answer) is not None
+
+
+def without_box(body: str | None, config: Config) -> str:
+    """The text of an issue without the answer of the box of [forms] opt_out_field, to
+    tell a click on the box from an edit of the text. The answer is cut out at its last
+    place, as a form writes the box last."""
+    body = body or ""
+    answer = form_fields(body).get(config.opt_out_field)
+    if not answer:
+        return body
+    start, _, end = body.rpartition(answer)
+    return start + end
+
+
+def opted_out(issue: dict[str, Any], config: Config) -> bool:
+    """Whether the AI stays out of the issue at its reporter's wish, also when it
+    reads for another issue: the box is ticked and the issue still muted. Both ways
+    back remove the label: the reporter's /assistant again and a maintainer's
+    /assistant unmute."""
+    return MUTED in label_names(issue) and box_ticked(text_of(issue), config)
+
+
 def detect_language(text: str) -> str:
     """The language of the catalog whose stopwords and letters of its own, as
     OWN_LETTERS describes them, the text has the most of; English when no other
@@ -3328,20 +3381,36 @@ def handle_event(
         assign_owners(github, issue, areas, config)
         if NEEDS_TRIAGE not in current:
             github.add_labels(number, [NEEDS_TRIAGE])
+        if box_ticked(text_of(issue), config):
+            return keep_out_the_ai(github, number, config)
         if is_maintainer(issue):
             return Plan(number, notes=["Opened by a maintainer: no analysis."])
         return limited(github, Plan(number, "triage"), issue, created(issue), config)
     if name == "issues" and action == "edited":
-        if "body" not in (payload.get("changes") or {}):
+        changes = payload.get("changes") or {}
+        if "body" not in changes:
             return Plan(number, notes=["A new title alone answers nothing."])
-        if (
-            issue["state"] == "open"
-            and login(payload.get("sender")) == author
-            and current & {NEEDS_INFO, STALE}
+        by_reporter = login(payload.get("sender")) == author
+        before = changes["body"].get("from")
+        # GitHub shows the box of the form as one that a click ticks in the issue.
+        clicked = by_reporter and box_ticked(text_of(issue), config) != box_ticked(
+            before, config
+        )
+        plan = Plan(number)
+        if clicked and box_ticked(text_of(issue), config):
+            plan = keep_out_the_ai(github, number, config)
+        if clicked and without_box(text_of(issue), config) == without_box(
+            before, config
         ):
-            plan = answered(github, issue, config)
+            # A click answers no question, and unticking the box starts nothing.
+            plan.notes = plan.notes or ["Unticking the box alone starts nothing."]
+            return plan
+        if issue["state"] == "open" and by_reporter and current & {NEEDS_INFO, STALE}:
+            # A follow-up of an edit that also ticked the box stops at the mute here.
+            plan = answered(github, issue, config, plan)
             return limited(github, plan, issue, moment(issue["updated_at"]), config)
-        return Plan(number, notes=["Edit without a pending question."])
+        plan.notes.append("Edit without a pending question.")
+        return plan
     if name == "issue_comment" and action == "created":
         comment = payload["comment"]
         given = command_of(issue, comment)
@@ -3357,6 +3426,20 @@ def handle_event(
         plan.notes.insert(0, refused)
         return plan
     return Plan(number, notes=[f"Event {name}.{action} is not handled."])
+
+
+def keep_out_the_ai(github: GitHub, number: int, config: Config) -> Plan:
+    """The reporter ticked the box of [forms] opt_out_field: the issue is muted, so
+    that no run of the AI starts on it, and all that runs without AI goes on."""
+    mute(github, number, config)
+    return Plan(
+        number,
+        notes=[
+            f"The reporter ticked the box {config.opt_out_field!r}: muted on "
+            f"#{number} ({MUTED}), no AI run; /assistant again of the reporter or "
+            "/assistant unmute ends it."
+        ],
+    )
 
 
 def discussion_by_hand(github: GitHub, number: int) -> Plan:
@@ -3539,11 +3622,7 @@ def carry_out(
     number = issue["number"]
     name = given.name
     if name == "mute":
-        if not any(
-            label["name"].casefold() == MUTED.casefold() for label in github.labels()
-        ):
-            github.create_label(muted_label(config))
-        github.add_labels(number, [MUTED])
+        mute(github, number, config)
         return Plan(number, notes=[f"Muted on #{number}: no AI run of its own."])
     if name == "unmute":
         github.remove_label(number, MUTED)
@@ -3573,6 +3652,16 @@ def defined_label(config: Config, starter: Label) -> Label:
     return next(
         (label for label in config.labels if label.name == starter.name), starter
     )
+
+
+def mute(github: GitHub, number: int, config: Config) -> None:
+    """Add the label of muted issues to the issue, which creates it where it is
+    missing."""
+    if not any(
+        label["name"].casefold() == MUTED.casefold() for label in github.labels()
+    ):
+        github.create_label(muted_label(config))
+    github.add_labels(number, [MUTED])
 
 
 def muted_label(config: Config) -> Label:
@@ -3613,7 +3702,10 @@ def again(
     A maintainer may ask for one at any time. The reporter may ask once per issue,
     while it waits for the maintainer's triage and after an analysis: its marker
     records the run, within the limits of the day, so that a deleted comment gives
-    no second one.
+    no second one. A reporter who kept the AI out with the box of the form lets it in
+    this way, and ends that mute with it, and no other. Without an analysis, a comment
+    of the assistant keeps that record, as nothing else would count the run or the
+    request; see render_let_in.
     """
     number = issue["number"]
     plan = Plan(number, "triage", ["New analysis on request."])
@@ -3623,21 +3715,60 @@ def again(
                 f"The reporter of #{number} may ask for a new analysis only while it "
                 f"has {NEEDS_TRIAGE}."
             )
-        analyses = [
-            item for item in github.comments(number) if kind_of(item) == "analysis"
-        ]
-        if not analyses:
+        comments = github.comments(number)
+        records = [item for item in comments if kind_of(item) in {"analysis", LET_IN}]
+        own_mute = muted_by_reporter(github, issue, comments, config)
+        if not records and not own_mute:
             return f"#{number} has no analysis that the reporter could ask again."
-        if any("again" in (marker(item) or ("", {}))[1] for item in analyses):
+        if any("again" in (marker(item) or ("", {}))[1] for item in records):
             return f"The reporter of #{number} asked for a new analysis once already."
-        plan.answers, plan.marks = analyses[-1], {"again": "1"}
-        plan = limited(github, plan, comment, created(comment), config)
+        # A comment that lets the AI in carries the mark from its start, so only
+        # analyses are left here.
+        if records:
+            plan.answers, plan.marks = records[-1], {"again": "1"}
+        at = created(comment)
+        if own_mute:
+            plan = within_limits(github, plan, comment, at, config, requested=True)
+        else:
+            plan = limited(github, plan, comment, at, config)
         if plan.mode == "none":
             return plan.notes[-1]
+        if not records:
+            language = issue_language(issue, comments)
+            github.comment(number, render_let_in(login(issue["user"]), language, at))
+        if own_mute:
+            github.remove_label(number, MUTED)
     if POSSIBLE_DUPLICATE in label_names(issue):
         # The new analysis adds it again, with a new notice, if it finds one.
         github.remove_label(number, POSSIBLE_DUPLICATE)
     return plan
+
+
+def muted_by_reporter(
+    github: GitHub,
+    issue: dict[str, Any],
+    comments: list[dict[str, Any]],
+    config: Config,
+) -> bool:
+    """Whether the issue is muted by the box of its form, which the reporter may undo.
+
+    A maintainer's mute, with /assistant mute or by hand, is not theirs to end, also
+    when they add the box to the text afterwards: a label that a person added, and
+    the command, tell the two apart, as the command adds it as a bot does.
+    """
+    if MUTED not in label_names(issue) or config.opt_out_field not in form_fields(
+        text_of(issue)
+    ):
+        return False
+    given = [command_of(issue, item) for item in comments if is_maintainer(item)]
+    if any(item is not None and item.name == "mute" for item in given):
+        return False
+    return not any(
+        event["event"] == "labeled"
+        and (event.get("label") or {}).get("name") == MUTED
+        and not is_bot(event.get("actor"))
+        for event in github.events(issue["number"])
+    )
 
 
 def mark_duplicate(
@@ -3709,6 +3840,8 @@ def within_limits(
     trigger: dict[str, Any],
     at: datetime,
     config: Config,
+    *,
+    requested: bool = False,
 ) -> Plan:
     """The plan, or none when its run of the AI would pass a limit of the day.
 
@@ -3733,7 +3866,11 @@ def within_limits(
     since = at - DAY
     # A new issue or discussion counts only those opened before it; a new analysis
     # that the reporter asked for counts every one of the day, as a follow-up does.
-    first = plan.mode in {"triage", "discussion-answer"} and plan.answers is None
+    first = (
+        plan.mode in {"triage", "discussion-answer"}
+        and plan.answers is None
+        and not requested
+    )
     opened = github.issues_since(since)
     if config.answer_categories:
         opened += [
@@ -4107,7 +4244,8 @@ def related_issues(
 ) -> list[dict[str, Any]]:
     """The other issues that the engine reads, the newest first: every open one, the
     max_issues closed ones that changed last and, for a first analysis, those that a
-    search for its words finds among the older ones."""
+    search for its words finds among the older ones; none whose reporter keeps the AI
+    out of it."""
     found = {
         item["number"]: item
         for item in github.recent_issues(limit(config, "max_issues"))
@@ -4124,7 +4262,7 @@ def related_issues(
     return [
         found[number]
         for number in sorted(found, reverse=True)
-        if not is_digest(found[number])
+        if not is_digest(found[number]) and not opted_out(found[number], config)
     ]
 
 
@@ -4440,7 +4578,7 @@ def write_siblings(
             found += [
                 (repository, item)
                 for item in other.search_issues(terms)
-                if not is_digest(item)
+                if not is_digest(item) and not opted_out(item, config)
             ]
         except GitHubError as error:
             command("warning", f"The search in {repository} failed: {error}")
@@ -5417,11 +5555,16 @@ def link_sections(language: str, related: list[str], references: list[str]) -> s
 
 
 def invitation(language: str, config: Config, *, duplicate: bool = False) -> str:
-    """The end of a footer: a link to how the assistant works, and the request for a
-    👍 or 👎, which on a duplicate notice also objects to the closing."""
+    """The end of a footer: a link to how the assistant works, the request for a 👍
+    or 👎, which on a duplicate notice also objects to the closing, and the link to
+    the project, unless `[transparency] credit` leaves it out."""
     notice = notice_link(config)
-    ask = say(language, "feedback.duplicate" if duplicate else "feedback")
-    return f"{say(language, 'about', notice=notice)} · {ask}" if notice else ask
+    ends = [
+        say(language, "about", notice=notice) if notice else "",
+        say(language, "feedback.duplicate" if duplicate else "feedback"),
+        say(language, "credit", project=PROJECT) if config.credit else "",
+    ]
+    return " · ".join(end for end in ends if end)
 
 
 def for_maintainers(
@@ -5623,11 +5766,13 @@ def render_answer(
 
 
 def issue_form(config: Config, kind: str) -> str:
-    """Where someone opens the issue that a discussion suggests: the bug report form
-    of the starter for a bug, where the repository has it, else the list of forms."""
+    """Where someone opens the issue that a discussion suggests: the form of the
+    starter for a bug or a feature, where the repository has it, else the list of
+    forms."""
     new = f"https://github.com/{config.repository}/issues/new"
-    if kind == "bug" and (config.root / FORM_STARTER).is_file():
-        return f"{new}?template={FORM_STARTER.name}"
+    form = FORM_STARTERS[kind]
+    if (config.root / form).is_file():
+        return f"{new}?template={form.name}"
     return f"{new}/choose"
 
 
@@ -5749,6 +5894,14 @@ def render_duplicate(number: int, author: str, language: str, config: Config) ->
         f"{say(language, 'duplicate.named', author=author, number=number)} "
         f"{say(language, 'duplicate.close', number=number, **periods)}\n{about}"
     )
+
+
+def render_let_in(author: str, language: str, at: datetime) -> str:
+    """The note that a reporter's /assistant again ended the mute of the box of the
+    form on an issue without an analysis. Its marker records the request and the run,
+    as the marker of the analysis does for any other new analysis."""
+    mark = render_marker(LET_IN, again=1, runs=int(at.timestamp()))
+    return f"{mark}\n{say(language, 'let-in', author=author)}\n"
 
 
 def render_reopened(author: str, language: str) -> str:
@@ -8325,14 +8478,21 @@ def check_forms(config: Config) -> list[str]:
     problems = []
     defined = {label.name for label in config.labels}
     options: list[str] = []
+    offered = False
     for path in sorted((config.root / FORMS).glob("*.y*ml")):
-        if path.stem == "config":
-            continue
         where = path.relative_to(config.root).as_posix()
         try:
             form = load_yaml(path, where)
         except SettingsError as error:
             problems += error.problems
+            continue
+        if path.stem == "config":
+            if CHOOSER_REPOSITORY in str(form):
+                problems.append(
+                    f"{where}: replace {CHOOSER_REPOSITORY} in its links with the "
+                    "owner and name of the repository; install does it where the "
+                    "remote origin names the repository"
+                )
             continue
         if not isinstance(form, dict):
             problems.append(f"{where} is no issue form")
@@ -8351,6 +8511,16 @@ def check_forms(config: Config) -> list[str]:
                 and attributes.get("label") == config.area_field
             ):
                 options += attributes.get("options") or []
+            if attributes.get("label") == config.opt_out_field:
+                offered = True
+                problems += opt_out_problems(where, item, config)
+    # A repository that keeps the default name and has no such box offers no opt-out;
+    # a name of its own that no form has is a mistake, and reporters would lose it.
+    if not offered and config.opt_out_field != Config.opt_out_field:
+        problems.append(
+            f"{SETTINGS / 'config.toml'}: [forms] opt_out_field names "
+            f"{config.opt_out_field!r}, which no form has"
+        )
     for option in dict.fromkeys(options):
         owners = [label.name for label in config.labels if option in label.form_options]
         if len(owners) > 1:
@@ -8366,6 +8536,18 @@ def check_forms(config: Config) -> list[str]:
                     f"{LABELS_FILE}: {label.name} names the option '{option}', which no form has"
                 )
     return problems
+
+
+def opt_out_problems(where: str, item: dict[str, Any], config: Config) -> list[str]:
+    """What keeps the field of [forms] opt_out_field in a form from being one box
+    that a reporter may leave unticked."""
+    field = f"{where}: the field {config.opt_out_field!r} of [forms] opt_out_field"
+    boxes = (item.get("attributes") or {}).get("options") or []
+    if item.get("type") != "checkboxes" or len(boxes) != 1:
+        return [f"{field} must be checkboxes with one box"]
+    if isinstance(boxes[0], dict) and boxes[0].get("required"):
+        return [f"{field} must not be required, or every reporter would opt out"]
+    return []
 
 
 # A block of hosts in the firewall template that belongs to one engine starts with
@@ -8966,26 +9148,81 @@ def add_to_actionlint(root: Path) -> list[str]:
 # The files of a set-up
 
 
-def add_form(root: Path, *, starter_labels: bool) -> list[str]:
-    """A bug report form for a repository without issue forms or templates.
+def chooser(config: Config) -> str:
+    """The chooser of the templates for the repository of `config`.
 
-    Its label bug and the answers of its field Area are those of the starter labels,
-    so install writes it only together with them; labels of the repository's own
-    may not map them, and a form overrides the templates of its owner's .github.
+    A question goes to the first category whose discussions get a first answer, as
+    someone with a question needs one place to ask it. Without such a category, or
+    without a notice to reporters, it has no link there.
+    """
+    category = config.answer_categories[0] if config.answer_categories else ""
+    values = {
+        CHOOSER_REPOSITORY: config.repository,
+        # GitHub's slug of a category, such as q-a for Q&A.
+        "CATEGORY": re.sub(r"\W+", "-", category.lower()).strip("-"),
+        "NOTICE_LINK": notice_link(config) or "",
+    }
+    template = (TEMPLATES / CHOOSER).read_text(encoding="utf-8")
+    kept = [
+        part
+        for part in re.split(r"(?m)^(?=  - name: )", template)
+        if all(value or name not in part for name, value in values.items())
+    ]
+    return re.sub("|".join(values), lambda found: values[found[0]], "".join(kept))
+
+
+def name_repository_in_chooser(root: Path, repository: str) -> list[str]:
+    """The links of a chooser that was written before the repository was known, now
+    with its name: the check asks for it, and only install, which knows it, can do it
+    without a person."""
+    placeholder = CHOOSER_REPOSITORY.encode()
+    done = []
+    for path in sorted((root / FORMS).glob("config.y*ml")) if repository else ():
+        content = path.read_bytes()
+        if placeholder in content:
+            path.write_bytes(content.replace(placeholder, repository.encode()))
+            where = path.relative_to(root).as_posix()
+            done.append(f"named {repository} in the links of {where}")
+    return done
+
+
+def add_forms(root: Path, repository: str, *, starter_labels: bool) -> list[str]:
+    """The forms of the starters and their chooser, for a repository without issue
+    forms or templates.
+
+    The labels of the forms and the answers of their field Area are those of the
+    starter labels, so install writes them only together with them; labels of the
+    repository's own may not map them, and a form overrides the templates of its
+    owner's .github. The chooser turns blank issues off, so it comes only with forms,
+    and one that the repository has stays. Its links need `repository`.
     """
     forms = root / FORMS
+    done = name_repository_in_chooser(root, repository)
     if forms.is_dir() and any(
         path.is_file() and path.stem != "config" for path in forms.iterdir()
     ):
-        return []
+        return done
     if not starter_labels:
         return [
-            f"wrote no issue form for your own {LABELS_FILE}; the starter "
-            f"{(TEMPLATES / FORM_STARTER).as_posix()} needs its labels and areas there"
+            *done,
+            f"wrote no issue forms for your own {LABELS_FILE}; the starters in "
+            f"{(TEMPLATES / FORMS).as_posix()} need its labels and areas there",
         ]
     forms.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(TEMPLATES / FORM_STARTER, root / FORM_STARTER)
-    return [f"wrote {FORM_STARTER}; adapt it"]
+    for form in FORM_STARTERS.values():
+        shutil.copyfile(TEMPLATES / form, root / form)
+        done.append(f"wrote {form}; adapt it")
+    if not any(forms.glob("config.y*ml")):
+        config = load_config(root, repository or CHOOSER_REPOSITORY, lenient=True)
+        (root / CHOOSER).write_text(chooser(config), encoding="utf-8", newline="\n")
+        done.append(
+            f"wrote {CHOOSER}; adapt it, and turn on what its links need on GitHub"
+            if repository
+            else f"wrote {CHOOSER}; replace {CHOOSER_REPOSITORY} in its links with the "
+            "repository, which neither GH_REPO nor the remote origin names, or run "
+            "install again once the remote does"
+        )
+    return done
 
 
 def notice(config: Config, engine: Engine, language: str) -> str:
@@ -9070,16 +9307,17 @@ def pinned(template: str, ref: str, version: str) -> str:
     return ACTION_PIN.sub(lambda pin: f"{pin['uses']}@{ref} # {version}", template)
 
 
-def install(root: Path, ref: str, version: str) -> list[str]:
+def install(root: Path, ref: str, version: str, repository: str = "") -> list[str]:
     """Write the workflows and the firewall policy of the templates into a repository.
 
     The workflow of the discussions only when config.toml names categories whose
     discussions get a first answer, as the starter does, or when it is there
     already. The starters are only written when they are missing: labels,
-    project.md, config.toml, findings.toml, and, with the starter labels, a bug
-    report form in a repository without issue forms. The notice to reporters, the entry of .gitignore and what actionlint
-    needs are added where they are missing, so that running it again changes
-    nothing but the workflows.
+    project.md, config.toml, findings.toml, and, with the starter labels, the forms of
+    a bug report and a feature request with their chooser, whose links name
+    `repository`, in a repository without issue forms. The notice to reporters, the
+    entry of .gitignore and what actionlint needs are added where they are missing,
+    so that running it again changes nothing but the workflows.
     """
     if not SHA.fullmatch(ref):
         raise AssistantError("Give the commit hash of the issue assistant's release.")
@@ -9111,7 +9349,6 @@ def install(root: Path, ref: str, version: str) -> list[str]:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(TEMPLATES / starter, target)
             done.append(f"wrote {starter}; adapt it")
-    done += add_form(root, starter_labels=starter_labels)
     # Once the starters are there: the settings say whether discussions get answers.
     if (root / WORKFLOWS / DISCUSSION_WORKFLOW).is_file() or load_config(
         root, "", lenient=True
@@ -9125,10 +9362,32 @@ def install(root: Path, ref: str, version: str) -> list[str]:
             "\n".join([*lines, entry]) + "\n", encoding="utf-8", newline="\n"
         )
         done.append(f"added {entry} to .gitignore")
-    return done + add_to_actionlint(root) + add_notices(root)
+    # Last, as the chooser links the notice.
+    return [
+        *done,
+        *add_to_actionlint(root),
+        *add_notices(root),
+        *add_forms(root, repository, starter_labels=starter_labels),
+    ]
 
 
 # Setting up GitHub
+
+
+def repository_of_remote(root: Path) -> str:
+    """The repository on GitHub that the remote origin of the checkout in `root`
+    names, as install finds it without gh; nothing for another host or no remote."""
+    found = GITHUB_REMOTE.fullmatch(git_says(root, "remote", "get-url", "origin") or "")
+    name = found["name"] if found else ""
+    return name if REPOSITORY_NAME.fullmatch(name) else ""
+
+
+def repository_to_name(root: Path) -> str:
+    """The repository that install names in the links of the chooser: GH_REPO, or else
+    GITHUB_REPOSITORY, or else the remote origin. Nothing here calls GitHub, so a value
+    of another form, such as HOST/OWNER/REPO, which gh takes, doesn't stop install."""
+    name = os.environ.get("GH_REPO") or os.environ.get("GITHUB_REPOSITORY", "")
+    return name if REPOSITORY_NAME.fullmatch(name) else repository_of_remote(root)
 
 
 def repository_of_checkout(root: Path) -> str:
@@ -9754,6 +10013,17 @@ SCORED_GROUPS = dict(
 LOCAL_ENGINES = tuple(
     key for key, engine in ENGINES.items() if engine.cli or engine.local
 )
+# The measures of a report, in its order, and the head of their table.
+MEASURES = (
+    *SCORED_GROUPS.values(),
+    "Duplicates",
+    "Sure duplicates",
+    "Asks for information",
+)
+MEASURES_HEAD = (
+    "| Measure | Precision | Recall | Issues |",
+    "| --- | ---: | ---: | ---: |",
+)
 
 
 @dataclass(frozen=True)
@@ -9861,8 +10131,9 @@ def maintainers_asked(
 def sample_of(github: GitHub, config: Config, issue: dict[str, Any]) -> Sample | None:
     """The sample of a closed issue that people labelled with a label of a scored
     group or closed as a duplicate of an older issue, and that the assistant never
-    analyzed; None for any other issue, such as one that a bot opened."""
-    if is_bot(issue["user"]):
+    analyzed; None for any other issue, such as one that a bot opened or whose
+    reporter keeps the AI out of it."""
+    if is_bot(issue["user"]) or opted_out(issue, config):
         return None
     duplicate = issue["duplicate_of"]
     original = (
@@ -10152,7 +10423,7 @@ def scores(outcomes: list[Outcome], config: Config) -> list[Score]:
             )
         )
     originals = sum(outcome.sample.original is not None for outcome in answered)
-    for name, sure in (("Duplicates", False), ("Sure duplicates", True)):
+    for name, sure in ((MEASURES[-3], False), (MEASURES[-2], True)):
         named = [
             (outcome, number)
             for outcome in answered
@@ -10166,7 +10437,7 @@ def scores(outcomes: list[Outcome], config: Config) -> list[Score]:
         found.append(Score(name, originals, len(named), originals, right))
     found.append(
         Score(
-            "Asks for information",
+            MEASURES[-1],
             len(answered),
             sum(outcome.asks for outcome in answered),
             sum(outcome.sample.asked for outcome in answered),
@@ -10248,8 +10519,7 @@ def render_evaluation(
         "with the issues, discussions and releases of that moment, and compared its "
         "choices with what the maintainers decided.",
         "",
-        "| Measure | Precision | Recall | Issues |",
-        "| --- | ---: | ---: | ---: |",
+        *MEASURES_HEAD,
         *(
             f"| {score.name} | {share(score.right, score.chosen)} | "
             f"{share(score.right, score.actual)} | {score.issues} |"
@@ -10462,6 +10732,183 @@ def evaluate(
     ]
 
 
+# The numbers of the accuracy page, from a report of `evaluate`. The job publish of
+# .github/workflows/evaluate.yml takes a report that a job with an AI wrote into a job
+# that writes, so the report counts as untrusted: only what passes the checks below
+# reaches the page, which are numbers and the names of a measure, the engine, the model
+# and the repository. The lines of the issues stay in the report.
+ACCURACY_PAGE = PurePosixPath("docs/accuracy.md")
+ACCURACY_BLOCK = re.compile(
+    r"^<!-- accuracy numbers: start -->\n"
+    r"(?P<sections>.*?)"
+    r"^<!-- accuracy numbers: end -->$",
+    re.DOTALL | re.MULTILINE,
+)
+# What comes before the lines of the issues in a report, as render_evaluation writes
+# it. A number has at most nine digits, which int() always takes.
+REPORT = re.compile(
+    r"# How accurate the issue assistant is on (?P<repository>\S+)\n"
+    r"\n"
+    r"Measured on (?P<day>\d{4}-\d{2}-\d{2}) with (?P<engine>[A-Za-z]+), "
+    r"`(?P<model>[\w.:/@-]+)`, on the (?P<replayed>\d{1,9}) newest of "
+    r"(?P<read>\d{1,9}) closed issues read [^\n]*\n"
+    r"\n"
+    + "".join(rf"{re.escape(line)}\n" for line in MEASURES_HEAD)
+    + r"(?P<rows>(?:\|[^\n]*\n)+)"
+    r"\n"
+    r"\*Precision\*[^\n]*\n"
+    r"(?:\n(?P<failed>\d{1,9}) of the \d{1,9} analyses failed; they count in no "
+    r"measure\.\n)?"
+    r"(?:\nThe analyses cost \$(?P<cost>\d{1,9}\.\d\d) at the prices of the API\.\n)?"
+    r"\n## Issue by issue\n",
+    re.ASCII,
+)
+REPORT_ROW = re.compile(
+    r"\| (?P<measure>[^|]+) \| (?P<precision>[^|]+) \| (?P<recall>[^|]+) \| "
+    r"(?P<issues>\d{1,9}) \|",
+    re.ASCII,
+)
+REPORT_SHARE = re.compile(r"\d{1,3} % \((\d{1,9}) of (\d{1,9})\)", re.ASCII)
+
+
+@dataclass(frozen=True)
+class Measurement:
+    """The numbers of a report of `evaluate`, and what they were measured on."""
+
+    repository: str
+    day: date
+    engine: str
+    model: str
+    replayed: int
+    read: int
+    # The lines of the table of measures.
+    rows: tuple[str, ...]
+    # How many analyses failed, and what they cost in dollars, if the report says.
+    failed: int
+    cost: str | None
+
+
+def fits_share(cell: str) -> bool:
+    """Whether a cell of the table of measures is what `share` writes for its numbers,
+    with no more of the part than of the whole."""
+    if cell == share(0, 0):
+        return True
+    found = REPORT_SHARE.fullmatch(cell)
+    if found is None:
+        return False
+    part, whole = int(found[1]), int(found[2])
+    return part <= whole and cell == share(part, whole)
+
+
+def fits_row(line: str) -> bool:
+    """Whether a line of the table of measures has a measure and its numbers."""
+    row = REPORT_ROW.fullmatch(line)
+    return (
+        row is not None
+        and row["measure"] in MEASURES
+        and fits_share(row["precision"])
+        and fits_share(row["recall"])
+    )
+
+
+def measurement_of(report_text: str) -> Measurement:
+    """The numbers of a report of `evaluate`, or an error when anything about them
+    isn't what `evaluate` writes."""
+    found = REPORT.match(report_text)
+    if found is None:
+        raise AssistantError(
+            "That is no report of evaluate: its head doesn't have the form of one."
+        )
+    rows = tuple(found["rows"].splitlines())
+    bad = next((row for row in rows if not fits_row(row)), None)
+    if bad is not None:
+        raise AssistantError(
+            f"That is no report of evaluate: the line {bad!r} of its table has no "
+            "measure with its numbers."
+        )
+    if not REPOSITORY_NAME.fullmatch(found["repository"]):
+        raise AssistantError(
+            "That is no report of evaluate: it names no repository as owner/name."
+        )
+    if found["engine"] not in {engine.name for engine in ENGINES.values()}:
+        raise AssistantError(
+            f"That is no report of evaluate: it names the engine {found['engine']}."
+        )
+    try:
+        day = date.fromisoformat(found["day"])
+    except ValueError:
+        raise AssistantError(
+            f"That is no report of evaluate: {found['day']} is no day."
+        ) from None
+    failed, replayed = int(found["failed"] or 0), int(found["replayed"])
+    if failed >= replayed:
+        raise AssistantError(
+            "That is no report of evaluate with numbers: no analysis gave an answer, "
+            f"as {failed} of the {replayed} failed."
+        )
+    return Measurement(
+        found["repository"],
+        day,
+        found["engine"],
+        found["model"],
+        replayed,
+        int(found["read"]),
+        rows,
+        failed,
+        found["cost"],
+    )
+
+
+def accuracy_section(found: Measurement) -> str:
+    """The part of the accuracy page for one repository."""
+    failed = (
+        f" {found.failed} of the {found.replayed} analyses failed; they count in no "
+        "measure."
+        if found.failed
+        else ""
+    )
+    cost = (
+        f" The analyses cost ${found.cost} at the prices of the API."
+        if found.cost
+        else ""
+    )
+    return "\n".join(
+        (
+            f"### [{found.repository}](https://github.com/{found.repository})",
+            "",
+            f"Measured on {found.day.isoformat()} with {found.engine}, "
+            f"{code_span(found.model)}, on the {found.replayed} newest of {found.read} "
+            "closed issues read that people labelled or closed as a duplicate of an "
+            f"older issue, and that the assistant never analyzed.{failed}{cost} Small "
+            "numbers vary: with few issues, one more found or missed moves a share a "
+            "lot, so each share names its counts.",
+            "",
+            *MEASURES_HEAD,
+            *found.rows,
+        )
+    )
+
+
+def page_with_numbers(page: str, found: Measurement) -> str:
+    """The accuracy page with the numbers in its block: a part for each repository,
+    in the order of their names, whose newest numbers replace its older ones. The text
+    that stands there before the first numbers goes."""
+    block = ACCURACY_BLOCK.search(page)
+    if block is None:
+        raise AssistantError(
+            f"{ACCURACY_PAGE} has no block of numbers between the lines "
+            "<!-- accuracy numbers: start --> and <!-- accuracy numbers: end -->."
+        )
+    kept = {
+        section[len("### [") : section.index("]")]: section.strip()
+        for section in re.split(r"(?m)^(?=### \[)", block["sections"])[1:]
+    }
+    kept[found.repository] = accuracy_section(found)
+    sections = "\n\n".join(kept[name] for name in sorted(kept, key=str.casefold))
+    start, end = block.span("sections")
+    return f"{page[:start]}\n{sections}\n\n{page[end:]}"
+
+
 def event_comment(number: int) -> int | None:
     """The id of the comment on the issue whose event started this run; None for any
     other event, such as a run by hand, and outside of GitHub Actions.
@@ -10508,7 +10955,7 @@ def repository_of_run(*, needed: bool) -> str:
 
 
 # The commands of the script with their help, in the order of --help, and below the
-# options of evaluate and install. They are constants, which mutmut leaves alone: its
+# options of some of them. They are constants, which mutmut leaves alone: its
 # mutants change what the commands do, which the tests check, and not the texts of
 # the help, which no test needs to check.
 SCRIPT_COMMANDS = {
@@ -10532,13 +10979,15 @@ SCRIPT_COMMANDS = {
     "evaluate": "measure how often a first analysis chooses the labels, duplicates and "
     "questions of the maintainers, by replaying closed issues with the engine's "
     "command line on this computer",
+    "accuracy-page": "write the numbers of a report of evaluate into "
+    "docs/accuracy.md of the checkout",
     "install": "write the workflows and the starters into a repository",
 }
 # The commands of one task of the engine, which take --issue and --mode, by default
 # from ISSUE and MODE.
 TASK_COMMANDS = ("engine", "context", "analyze", "apply", "usage")
 # The commands that read only the checkout, so they run anywhere, also on a computer
-# without GH_REPO; the others, but install, call GitHub.
+# without GH_REPO; the others, but install and accuracy-page, call GitHub.
 OFFLINE_COMMANDS = ("check", "endpoints", "engine", "analyze", "usage")
 SCRIPT_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
     "evaluate": {
@@ -10558,6 +11007,18 @@ SCRIPT_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
             "type": Path,
             "help": "the Markdown file of the report, outside the checkout; by default "
             "NAME-accuracy.md next to it",
+        },
+    },
+    "accuracy-page": {
+        "--report": {
+            "type": Path,
+            "required": True,
+            "help": "the Markdown file of the report of evaluate",
+        },
+        "--repository": {
+            "required": True,
+            "help": "the repository that the run measured, as owner/name; a report "
+            "that names another one is refused",
         },
     },
     "install": {
@@ -10624,6 +11085,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if arguments.command == "install":
             return install_command(root, arguments)
+        if arguments.command == "accuracy-page":
+            return accuracy_page_command(root, arguments.report, arguments.repository)
         repository = repository_of_run(needed=arguments.command not in OFFLINE_COMMANDS)
         if arguments.command == "check":
             return check_command(root, repository)
@@ -10673,7 +11136,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def install_command(root: Path, arguments: argparse.Namespace) -> int:
     ref, version = release_of(TOOL, arguments.ref, arguments.version)
-    for line in install(root, ref, version):
+    for line in install(root, ref, version, repository_to_name(root)):
         print(line)
     if arguments.setup:
         if shutil.which("gh") is None:
@@ -10806,6 +11269,27 @@ def evaluate_command(
     finally:
         shutil.rmtree(work, ignore_errors=True)
     summary(f"Accuracy on {repository}", lines, False)
+    return 0
+
+
+def accuracy_page_command(root: Path, report_file: Path, repository: str) -> int:
+    page = root / ACCURACY_PAGE
+    try:
+        report_text = report_file.read_text(encoding="utf-8")
+        before = page.read_text(encoding="utf-8")
+    except (OSError, ValueError) as error:
+        raise AssistantError(f"accuracy-page can't read a file: {error}") from None
+    found = measurement_of(report_text)
+    if found.repository != repository:
+        raise AssistantError(
+            f"This run measured {repository}, and the report names {found.repository}."
+        )
+    page.write_text(page_with_numbers(before, found), encoding="utf-8")
+    summary(
+        f"Accuracy on {found.repository}",
+        [f"The numbers of {found.day.isoformat()} are in {ACCURACY_PAGE}."],
+        False,
+    )
     return 0
 
 

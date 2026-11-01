@@ -18,6 +18,8 @@ import pytest
 import issue_assistant as assistant
 from support import (
     BOT_USER,
+    BOX_TICKED,
+    BOX_UNTICKED,
     BUG_BODY,
     FakeGitHub,
     Frozen,
@@ -63,6 +65,36 @@ def comment_files():
 @pytest.mark.parametrize("name", sorted(comment_files()))
 def test_every_comment_reads_as_its_golden_file(name):
     assert_golden(name, comment_files()[name])
+
+
+# A repository that sets [transparency] credit = false: the comments of the AI, whose
+# footers link the project in the files above, without that link.
+CREDITED = ("analysis", "follow-up", "answer", "discussion-answer")
+
+
+def comment_files_without_credit():
+    return {
+        f"comments/without-credit/{example.kind}.{language}.md.txt": example.texts[
+            language
+        ]
+        for example in hooks.examples(credit=False)
+        if example.kind in CREDITED
+        for language in ("en", "de")
+    }
+
+
+@pytest.mark.parametrize("name", sorted(comment_files_without_credit()))
+def test_a_comment_without_the_credit_reads_as_its_golden_file(name):
+    text = comment_files_without_credit()[name]
+    assert assistant.PROJECT not in text
+    assert_golden(name, text)
+
+
+@pytest.mark.parametrize("kind", CREDITED)
+@pytest.mark.parametrize("language", ["en", "de"])
+def test_every_comment_of_the_ai_links_the_project(kind, language):
+    name = f"comments/{kind}.{language}.md.txt"
+    assert f"]({assistant.PROJECT})</sub>" in comment_files()[name]
 
 
 # The comments page shows the summary for the maintainers below an analysis in
@@ -188,8 +220,10 @@ def opened(config, author="reporter", association="NONE", **changes):
     return FakeGitHub(config, issue), "issues", event("opened", issue, author)
 
 
-def edited(config, editor="reporter", **changes):
-    github = FakeGitHub(config, make_issue(labels=("bug", "needs-info", "stale")))
+def edited(config, editor="reporter", before=BUG_BODY, **changes):
+    github = FakeGitHub(
+        config, make_issue(labels=("bug", "needs-info", "stale"), body=before)
+    )
     github.comment_store[12] = [analysis(questions=1)]
     found = github.edit(12, editor, **changes)
     payload = event("edited", github.issue(12), editor, changes=found)
@@ -203,6 +237,18 @@ def commented(config, author, text, *, labels=("bug", "needs-info"), **options):
     comment = make_comment(5, author, text, 0, association)
     github.comment_store[12] = [analysis(questions=1, days_ago=2), comment]
     payload = event("created", github.issue(12), author, comment)
+    return github, "issue_comment", payload
+
+
+def again_after_the_box(config):
+    """The reporter of #12, muted by the box of its form, lets the AI in."""
+    issue = make_issue(
+        labels=("bug", "needs-triage", "assistant-muted"), body=BOX_TICKED
+    )
+    comment = make_comment(5, "reporter", "/assistant again", 0, "NONE")
+    github = FakeGitHub(config, issue)
+    github.comment_store[12] = [comment]
+    payload = event("created", github.issue(12), "reporter", comment)
     return github, "issue_comment", payload
 
 
@@ -247,6 +293,15 @@ def by_hand(config):
 
 EVENTS = {
     "opened": opened,
+    "opened with the box ticked": lambda config: opened(config, body=BOX_TICKED),
+    "opened with the box unticked": lambda config: opened(config, body=BOX_UNTICKED),
+    "box ticked by an edit": lambda config: edited(
+        config, before=BOX_UNTICKED, body=BOX_TICKED
+    ),
+    "box unticked by an edit": lambda config: edited(
+        config, before=BOX_TICKED, body=BOX_UNTICKED
+    ),
+    "again of the reporter who ticked the box": again_after_the_box,
     "opened by a maintainer": lambda config: opened(config, "maintainer", "OWNER"),
     "opened by a bot": lambda config: opened(config, "renovate[bot]"),
     "pull request": lambda config: opened(config, pull_request={"url": "x"}),
@@ -445,6 +500,7 @@ def test_the_digest_issue_reads_as_its_golden_file(monkeypatch, tmp_path, root, 
 def test_every_golden_file_has_its_test():
     names = {
         *comment_files(),
+        *comment_files_without_credit(),
         OTHER,
         *(f"context/{mode}.txt" for mode in assistant.MODES),
         "context/triage-related.txt",

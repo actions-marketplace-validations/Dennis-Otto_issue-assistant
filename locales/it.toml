@@ -90,6 +90,7 @@ footer = """\
   {feedback}</sub>"""
 labels = " Etichette: {labels}."
 about = "[Come funziona l'assistente]({notice})"
+credit = "[assistente per le segnalazioni]({project})"
 feedback = "Un 👍 o un 👎 su questo commento dice ai manutentori se è stato utile."
 "feedback.duplicate" = """\
   Un 👍 o un 👎 su questo commento dice ai manutentori se è stato utile; un 👎 tiene \
@@ -145,6 +146,7 @@ reminder = """\
   Chiusa come duplicato di #{number}, come annunciato {grace_days} fa. Continua lì; un \
   👍 su #{number} mostra che sono coinvolte più persone. Se è stato un errore, scrivi \
   un commento e i manutentori la riapriranno."""
+"let-in" = "Grazie, @{author}: ora l'IA può leggere questa issue, come hai chiesto, e la sua analisi arriverà a breve. Puoi chiederlo una volta per issue."
 reopened = """\
   Grazie per la risposta, @{author}! Ho riaperto la segnalazione; i manutentori le \
   daranno un'altra occhiata."""

@@ -67,7 +67,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any, NamedTuple
@@ -625,7 +625,7 @@ KINDS = {
         "discussions. Its questions add the label `needs-info`. More than "
         "{open_links} links to issues and files fold into one line, and the footer "
         "links the notice to reporters and asks for a 👍 or 👎, which the summary of "
-        "the daily sweep counts.",
+        "the daily sweep counts, and ends with a link to the project.",
     ),
     "maintainers": (
         "A summary for the maintainers",
@@ -706,6 +706,12 @@ KINDS = {
     "reopened": (
         "Reopened by an answer",
         "An answer of the reporter reopens an issue that closed for want of one.",
+    ),
+    "let-in": (
+        "The AI let in after the box",
+        "A reporter who kept the AI out with the box of the form, and writes "
+        "`/assistant again` on an issue without an analysis, gets this note. Its "
+        "hidden marker records the one request of the issue and the run of the day.",
     ),
     "closed-duplicate": (
         "Closed as a duplicate",
@@ -954,6 +960,9 @@ def comments(ia: ModuleType, config: Any, language: str) -> dict[str, str]:
         "reminder": reminder(ia, language),
         "closed-unanswered": ia.render_closed_unanswered(REPORTER, language),
         "reopened": ia.render_reopened(REPORTER, language),
+        "let-in": ia.render_let_in(
+            REPORTER, language, datetime(2026, 11, 1, tzinfo=UTC)
+        ),
         "closed-duplicate": ia.render_closed_duplicate(23, language),
         "fixed": ia.render_fixed(43, "main", language),
         "released": ia.render_released(REPORTER, release, [43], language),
@@ -1052,8 +1061,9 @@ def reminder(ia: ModuleType, language: str) -> str:
     )
 
 
-def examples() -> list[Example]:
-    """The comments of the page, in the order of the life of an issue."""
+def examples(**settings: Any) -> list[Example]:
+    """The comments of the page, in the order of the life of an issue, for a
+    repository with these settings of its Config."""
     ia = assistant()
     texts: dict[str, dict[str, str]] = {kind: {} for kind in KINDS}
     with tempfile.TemporaryDirectory() as folder:
@@ -1061,7 +1071,9 @@ def examples() -> list[Example]:
         for path, text in DEMO_FILES.items():
             (root / path).parent.mkdir(parents=True, exist_ok=True)
             (root / path).write_text(text, "utf-8")
-        config = ia.Config(root=root, repository=DEMO, labels=(), project="")
+        config = ia.Config(
+            root=root, repository=DEMO, labels=(), project="", **settings
+        )
         for language in LANGUAGES:
             for kind, text in comments(ia, config, language).items():
                 texts[kind][language] = text
@@ -1232,6 +1244,7 @@ FEATURES = (
     "features/slash-commands.md",
     "features/fix-to-release.md",
     "features/what-the-ai-reads.md",
+    "features/opt-out.md",
     "features/languages.md",
     "features/limits.md",
     "features/cost.md",
