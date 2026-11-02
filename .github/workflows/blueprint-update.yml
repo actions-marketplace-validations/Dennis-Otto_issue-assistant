@@ -115,7 +115,7 @@ jobs:
             echo
             echo "This repository $missing, which $BOT needs to $TASK; $WITHOUT. The release app is a GitHub App of the owner, whose token may do what the token of a job can't: start the checks of a pull request, change a workflow and apply the settings."
             echo
-            echo "\`python3 .github/blueprint.py checklist\` shows the steps: a link that registers the app with its permissions filled in, the update of the answers of the blueprint that names it in \`.github/repository.toml\`, the settings and its private key. Once they are done, $BOT can $TASK in its next run."
+            echo "\`python3 .github/blueprint.py app register\` registers the app, sets its private key and opens the pull request that names it in \`.github/repository.toml\`; \`python3 .github/blueprint.py checklist\` shows what is left, such as its installation and the settings. Once they are done, $BOT can $TASK in its next run."
           } >> "$GITHUB_STEP_SUMMARY"
           if [[ "$REQUIRED" == true ]]; then
             exit 1
@@ -183,7 +183,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - name: Install the hash-pinned Copier

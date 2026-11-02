@@ -2,14 +2,14 @@
 
 [← README](https://github.com/Dennis-Otto/issue-assistant) · [Security design](security.md) · [Roadmap](roadmap.md)
 
-The issue assistant is a composite GitHub Action. `action.yml` runs `issue_assistant.py` with the Python 3.12 of GitHub's runners and the standard library alone; the script talks to GitHub through the GitHub CLI. Four workflows in the repository that it looks after call the action, and one step of one job runs the AI engine.
+The issue assistant is a composite GitHub Action. `action.yml` runs the package `issue_assistant/` with the Python 3.12 of GitHub's runners and the standard library alone; the package talks to GitHub through the GitHub CLI. Four workflows in the repository that it looks after call the action, and one step of one job runs the AI engine.
 
 ## Components
 
 | Component | Files | What it does |
 | --- | --- | --- |
-| The action | `action.yml` | Passes every input through the environment to `issue_assistant.py` and runs one command of it |
-| Commands | `main()` in `issue_assistant.py`, which hands each command of `SCRIPT_COMMANDS` to a function of its own | `event`, `engine`, `context`, `analyze`, `usage`, `apply`, `sweep`, `sync-labels`, `findings`, `check`, `install`, `evaluate`, which replays closed issues as they were with the class `Then`, a view of GitHub at a moment, and `accuracy-page`, which takes the numbers of its report onto the website; [the reference](reference.md#commands) names what each does |
+| The action | `action.yml` | Passes every input through the environment to the package `issue_assistant` and runs one command of it |
+| Commands | `main()` in `issue_assistant/cli.py`, which hands each command of `SCRIPT_COMMANDS` to a function of its own | `event`, `engine`, `context`, `analyze`, `usage`, `apply`, `sweep`, `sync-labels`, `findings`, `check`, `install`, `evaluate`, which replays closed issues as they were with the class `Then`, a view of GitHub at a moment, and `accuracy-page`, which takes the numbers of its report onto the website; [the reference](reference.md#commands) names what each does |
 | GitHub client | the class `GitHub` | Every read and write through `gh api`, each with the version of GitHub's API that the tests check it against; in a dry run it only records what it would write |
 | Settings | `load_config`, `load_labels`, `load_findings` | Read `.github/issue-assistant/config.toml`, `.github/labels.toml` and `.github/findings.toml` of the repository |
 | Events | `handle_event`, `limited`, `within_limits` | Labels and owners from the issue forms, and the next task of the engine: `triage`, `follow-up`, `maintainer-reply`, `release-reply` or `maintainer-question`, never on a muted issue but on a maintainer's command, and within the [limits of the AI runs](features/limits.md) for the tasks that people who don't maintain the repository start |
@@ -23,6 +23,10 @@ The issue assistant is a composite GitHub Action. `action.yml` runs `issue_assis
 | Findings | `watch_findings` | Dismiss the findings of code scanning that `findings.toml` accepts and fail while others are open |
 | Fixture | `read_fixture`, `GitHub.use_fixture` | An issue and its comments from a JSON file in place of GitHub's, for [the canary](architecture/dry-runs.md#the-canary) and for trying a prompt; `context` and `apply` then write nothing |
 | Set-up | `install`, `set_up_github`, `check` | Write the four workflows, the one of the discussions where `config.toml` names categories, the firewall policy and the starter files of `templates/` into a repository, add the notice to reporters and actionlint's ignored `queue` where they are missing, with `--setup` also create the environment `issue-assistant` and have gh ask for the engine's secret, and check that the set-up still fits the templates; only `check` needs nothing but the checkout, and both name its files with slashes on every system |
+
+## The modules of the package
+
+The code is the package `issue_assistant/`, in layers: each module imports only from those before it. [The modules of the package](architecture/modules.md) has the map, with what each holds.
 
 ## The workflows of a repository
 
@@ -69,6 +73,8 @@ The jobs are in `.github/workflows/reusable-issue-assistant.yml`, which the temp
 
 The checkout reaches `github.com` and the GitHub CLI `api.github.com`; Harden-Runner allows the hosts of the runner itself, such as those of the logs and the summary. The action turns off the telemetry of the GitHub CLI, which would only knock at a blocked host. The job `egress` of the Action test runs the action behind the same block, so a host that it starts to need fails there, before a release blocks it in every repository. In a private repository the block needs a subscription or trial of StepSecurity; without one, Harden-Runner lets the job run unblocked, as the [security design](security.md) says among its residual risks.
 
+**A job that blocks waits twice, for Harden-Runner.** Right after Harden-Runner, the step *Wait until Harden-Runner lets the hosts through* asks each host of the job until it answers, for two minutes at most, because the runner may have asked for an address past Harden-Runner, which blocks that address for as long as `systemd-resolved` keeps it, up to a minute. As the last step of a job without sudo and containers, *Wait until Harden-Runner has removed Docker* waits for the `apt-get` that Harden-Runner runs in the background, also for two minutes at most, because a job that ends before it finishes hangs in *Cleaning up orphan processes* until its timeout. After two minutes each warns and goes on. The block itself stays as it is. [Decision 0088 of the blueprint](https://github.com/Dennis-Otto/repo-blueprint/blob/main/docs/decisions/0088-jobs-that-block-wait-for-their-hosts-and-try-again-when-they-hang.md) gives the reasons for the workflows that the blueprint brings; `tests/test_templates.py` keeps the workflows of this project, those that every repository calls above all, to the same steps. On the runner of `ISSUE_ASSISTANT_AI_RUNNER`, `analyze` asks only for GitHub's hosts: the firewall policy also names the hosts of engines that the repository may not use, and a mirror of Ubuntu that answers only on port 80, which would hold up the AI for two minutes.
+
 **The AI has a runner in reserve.** GitHub's egress-firewall runner is a technical preview. Should GitHub rename or end it, `analyze` would wait in the queue for up to a day, and every later run of its issue behind it. So the repository variable `ISSUE_ASSISTANT_AI_RUNNER` may name another runner in its place, without a release; [decision 0019](decisions/0019-a-runner-for-the-ai-when-the-firewall-runner-is-gone.md) explains the trade-off:
 
 <picture>
@@ -85,7 +91,7 @@ The command `endpoints` of the job `event` accepts only GitHub's runners of Ubun
 - **The requests follow a version of GitHub's API, not its default.** Every call asks for `API_VERSION`. The tests check every GraphQL document and every REST request against GitHub's own schema and description, and every week against those of that day; [decision 0024](decisions/0024-requests-against-github-s-own-descriptions.md) explains how.
 - **An error of GitHub is never an answer.** Only "not found" means that a thing is missing; any other error stops the run instead of changing what it posts, and a run again completes it without a second comment.
 - **No text can make it slow.** Issues come from anyone, so every pattern that reads them takes time linear in the length of the text.
-- **No third-party packages.** The script needs only the standard library, `gh` and `git`, which GitHub's runners have.
+- **No third-party packages.** The package needs only the standard library, `gh` and `git`, which GitHub's runners have.
 - **The maintainer has the last word.** The assistant labels, asks and suggests; it never decides on behalf of the maintainer.
 
 ## The details
@@ -94,5 +100,6 @@ Each of these has a page of its own:
 
 - [How a change of a template reaches the repositories](architecture/templates.md)
 - [How the assistant is tested](architecture/testing.md)
+- [The modules of the package](architecture/modules.md)
 - [The canary and the Workflow test](architecture/dry-runs.md)
 - [Failures and hard texts](architecture/failures.md)

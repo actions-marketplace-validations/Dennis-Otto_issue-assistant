@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tomllib
+import webbrowser
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,9 +25,10 @@ from blueprint import (
     screenshots,
     versions,
 )
+from blueprint.app import TIMEOUT, connect, register
 from blueprint.bootstrap import CreateError, create, doctor
 from blueprint.bot_health import renovate_report, sweep, watch_run
-from blueprint.branches import next_branch
+from blueprint.branches import job_from, next_branch
 from blueprint.changelog import (
     FRAGMENTS,
     FragmentError,
@@ -52,6 +54,7 @@ from blueprint.coach import (
     summary,
     undeclared,
     unknown,
+    unverified_commits,
 )
 from blueprint.coach import annotation as coach_annotation
 from blueprint.coach import report as coach_report
@@ -84,6 +87,7 @@ from blueprint.fixes import keep as keep_fixes
 from blueprint.github import Api, GitHubError, Json, current_repo
 from blueprint.notices import third_party_notices
 from blueprint.overrides import write_overrides
+from blueprint.ownership import check as ownership_check
 from blueprint.pages import (
     CELL_WORDS,
     Layout,
@@ -112,6 +116,7 @@ from blueprint.settings import (
 )
 from blueprint.site_check import annotation as site_annotation
 from blueprint.site_check import check as check_site
+from blueprint.site_check import map_rule
 from blueprint.update import SOURCE, Outdated, update_pull_request
 from blueprint.vex import openvex
 
@@ -213,6 +218,30 @@ def read_coverage(head: str, base: str) -> tuple[Coverage, Coverage | None] | No
     return found, before
 
 
+def ownership_command(arguments: argparse.Namespace, root: Path) -> int:
+    """The step of the check lint, which needs neither the API nor the settings."""
+    try:
+        listing = arguments.changed.read_bytes()
+        part_diff = (
+            arguments.contributing_diff.read_text(encoding="utf-8", errors="replace")
+            if arguments.contributing_diff
+            else ""
+        )
+    except OSError as error:
+        print(f"blueprint.py: {error}", file=sys.stderr)
+        return 2
+    return ownership_check(
+        root,
+        listing,
+        part_diff=part_diff,
+        branch=arguments.branch,
+        head_repo=arguments.head_repo,
+        repo=arguments.repo or "",
+        author_type=arguments.author_type,
+        mode=arguments.mode,
+    )
+
+
 def explain_command(arguments: argparse.Namespace, root: Path) -> int:
     """What failed and how to fix it: in the log, and in the CI also in the summary
     of the job and as an annotation, from the variables that GitHub sets."""
@@ -258,7 +287,8 @@ def explain(catalog: Catalog, name: str, step: bool, within: str = "") -> None:
         sys.stdout.write(text)
     else:
         repo = os.environ.get("GITHUB_REPOSITORY") or None
-        entry = entry.within(repo)
+        # The branch that a pull request goes into, which the runner names for it.
+        entry = entry.within(repo, os.environ.get("GITHUB_BASE_REF") or None)
         sys.stdout.write(plain(entry, step, within))
         if os.environ.get("GITHUB_ACTIONS") == "true":
             print(coach_annotation(entry, step, within))
@@ -268,10 +298,28 @@ def explain(catalog: Catalog, name: str, step: bool, within: str = "") -> None:
             os.environ.get("GITHUB_SERVER_URL") or "https://github.com",
         )
         text = summary(entry, step, url, within)
+    to_summary(text)
+
+
+def to_summary(text: str) -> None:
+    """Text at the end of the summary of the job, in the CI."""
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if target:
         with Path(target).open("a", encoding="utf-8") as file:
             file.write(text + "\n")
+
+
+def signatures_command(api: Api, repo: str, arguments: argparse.Namespace) -> int:
+    """The check signed commits: each commit of the pull request that blocks its merge,
+    as an annotation and in the summary. It fails as GitHub's rule blocks the merge."""
+    unverified = unverified_commits(api, repo, arguments.pull, arguments.base)
+    if not unverified:
+        print(f"No commit of #{arguments.pull} blocks its merge.")
+        return 0
+    for commit in unverified:
+        print(commit.annotation())
+    to_summary("\n".join(commit.finding().markdown() for commit in unverified))
+    return 1
 
 
 def bot_health_command(
@@ -285,7 +333,9 @@ def bot_health_command(
         summary, healthy = sweep(api, repo, root, now)
         print(summary, end="")
         return 0 if healthy else 1
-    print(renovate_report(api, repo, Path(arguments.log), arguments.run), end="")
+    complete = arguments.result == "success"
+    logs = map(Path, arguments.log)
+    print(renovate_report(api, repo, logs, arguments.run, complete=complete), end="")
     return 0
 
 
@@ -817,14 +867,16 @@ def locks_command(arguments: argparse.Namespace, root: Path) -> int:
 
 def site_check_command(arguments: argparse.Namespace, root: Path) -> int:
     """What the website that MkDocs built promises, one broken promise on each line,
-    and in the CI also as annotations; with --output, the further languages and the
-    path of the address for the steps that follow."""
+    and in the CI also as annotations; with --output, the further languages, the
+    path of the address and the rule that checks the links of its map for the steps
+    that follow."""
     folder = Path(arguments.site).as_posix().rstrip("/") or "."
     site = check_site(root / arguments.site, root, arguments.docs)
     if arguments.output:
         with Path(arguments.output).open("a", encoding="utf-8") as file:
             file.write(f"languages={' '.join(site.further)}\n")
             file.write(f"root={site.root}\n")
+            file.write(f"map={map_rule(site, root / arguments.site)}\n")
     if not site.findings:
         languages = " ".join((site.default, *site.further)).strip() or "one language"
         print(f"The website in {folder} keeps what its hooks promise ({languages}).")
@@ -842,7 +894,10 @@ def site_check_command(arguments: argparse.Namespace, root: Path) -> int:
         "with what the hooks write, and report it to the blueprint if its hooks "
         "need to change. A page that loads more than it may at once names what it "
         "loads the most: a picture that is too large, or Mermaid, which a "
-        "```mermaid block loads and the pictures of scripts/diagrams.sh don't. A "
+        "```mermaid block loads and the pictures of scripts/diagrams.sh don't. "
+        "llms.txt, the map of the website that the hooks write from its menu, leads "
+        "to the pages that the menu lists; a file of the project's own in its place "
+        "follows https://llmstxt.org/ and links the pages of the website. A "
         "page that lacks a picture of its Markdown, or has an empty paragraph where "
         "one was, lost it in the build: build the website with the lock of its "
         "tools, .github/docs-requirements.txt (stacks/docs/requirements-docs.txt in "
@@ -993,6 +1048,35 @@ def create_command(api: Api, arguments: argparse.Namespace, root: Path) -> int:
     return 2 if applied == 2 else 0
 
 
+def app_command(arguments: argparse.Namespace, root: Path) -> int:
+    """blueprint.py app: the release app of the owner, from its manifest or as one that
+    exists. Git and gh do the work, and the settings play no part in it."""
+    try:
+        if arguments.action == "register":
+            register(
+                root,
+                repo=arguments.repo,
+                org=arguments.org,
+                update=not arguments.no_update,
+                browser=None if arguments.no_browser else webbrowser.open,
+                timeout=arguments.timeout,
+            )
+        else:
+            connect(
+                root,
+                arguments.key_file,
+                repo=arguments.repo,
+                name=arguments.name,
+                client_id=arguments.client_id,
+                app_id=arguments.app_id,
+                update=not arguments.no_update,
+            )
+    except (CreateError, OSError) as error:
+        print(f"blueprint.py: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def utf8_output() -> None:
     """Windows consoles default to a code page without the marks of the checklist, and
     to CRLF, which a file of the repository written from the output must not get."""
@@ -1021,6 +1105,61 @@ def add_settings_parsers(
     commands.add_parser(
         "checklist", help="the steps outside the API, and which are done"
     )
+    app_parser = commands.add_parser(
+        "app",
+        help="the release app of the owner: register one from GitHub's manifest, or "
+        "connect one that exists",
+    )
+    app_actions = app_parser.add_subparsers(dest="action", required=True)
+    register_parser = app_actions.add_parser(
+        "register",
+        help="register the app on one page of GitHub, set its private key without "
+        "a file, and open the pull request that names it",
+    )
+    register_parser.add_argument(
+        "--org",
+        metavar="ORG",
+        help="the organization that owns the repository, which GitHub otherwise tells",
+    )
+    register_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="only print the address of the page",
+    )
+    register_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=TIMEOUT,
+        metavar="SECONDS",
+        help=f"how long to wait for the page of GitHub; {TIMEOUT} by default",
+    )
+    connect_parser = app_actions.add_parser(
+        "connect",
+        help="set the private key of an app that exists from a file, and name the app "
+        "unless the answers of the blueprint do",
+    )
+    connect_parser.add_argument(
+        "--key-file",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="the private key that GitHub gave you",
+    )
+    connect_parser.add_argument(
+        "--name", default="", help="the name in the address of the app"
+    )
+    connect_parser.add_argument(
+        "--client-id", default="", help="the Client ID on the settings page of the app"
+    )
+    connect_parser.add_argument(
+        "--app-id", default="", help="the App ID on the settings page of the app"
+    )
+    for action_parser in (register_parser, connect_parser):
+        action_parser.add_argument(
+            "--no-update",
+            action="store_true",
+            help="print the commands that name the app, and run none of them",
+        )
     create_parser = commands.add_parser(
         "create",
         help="the repository on GitHub of a new copy: git init, the first commit, "
@@ -1178,6 +1317,34 @@ def add_update_parsers(
     )
 
 
+def add_ownership_parser(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """The notice for a pull request that changes a file of the blueprint."""
+    parser = commands.add_parser(
+        "ownership",
+        help="annotate each changed file of a pull request that belongs to the "
+        "blueprint, for the check lint",
+    )
+    parser.add_argument(
+        "changed", type=Path, help="the file with the output of git diff -z --name-only"
+    )
+    parser.add_argument(
+        "--contributing-diff",
+        type=Path,
+        help="the file with the git diff of CONTRIBUTING.md: a change that stays "
+        "between its two marked lines belongs to the project",
+    )
+    parser.add_argument("--branch", default="", help="the head branch")
+    parser.add_argument("--head-repo", default="", help="the repository of the branch")
+    parser.add_argument("--author-type", default="", help="the type of the author")
+    parser.add_argument(
+        "--mode",
+        default="",
+        help="fail makes each file a failure; anything else leaves a notice",
+    )
+
+
 def add_coach_parsers(
     commands: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -1221,6 +1388,17 @@ def add_coach_parsers(
     )
     coach_report_parser.add_argument(
         "--coverage-base", default="", help="the coverage report of main, if any"
+    )
+    signatures_parser = coach_actions.add_parser(
+        "signatures",
+        help="whether a commit of a pull request lacks the verified signature that the "
+        "rules of the branch that it goes into require, which blocks its merge",
+    )
+    signatures_parser.add_argument(
+        "pull", type=int, help="the number of the pull request"
+    )
+    signatures_parser.add_argument(
+        "--base", required=True, help="the branch that it goes into"
     )
     coach_actions.add_parser(
         "verify",
@@ -1267,9 +1445,17 @@ def add_bot_health_parsers(
     renovate_parser = health.add_parser(
         "renovate", help="the warnings and errors of a run of Renovate, in one issue"
     )
-    renovate_parser.add_argument("log", help="the log of Renovate in JSON")
+    renovate_parser.add_argument(
+        "log", nargs="+", help="the logs of Renovate in JSON, of one run"
+    )
     renovate_parser.add_argument(
         "--run", required=True, help="the link of the run of Renovate"
+    )
+    renovate_parser.add_argument(
+        "--result",
+        default="success",
+        help="how the runs ended, as GitHub says it; without success, the run doesn't "
+        "count as one without problems",
     )
 
 
@@ -1636,8 +1822,8 @@ def add_pages_parsers(
         "site-check",
         help="what the website that MkDocs built promises: a sitemap in every folder "
         "of pages, the 404 page in the default language, one canonical address and "
-        "full addresses of the other languages on every page, and every picture of "
-        "the Markdown of a page on it",
+        "full addresses of the other languages on every page, every picture of "
+        "the Markdown of a page on it, and a map of the website, llms.txt",
     )
     site_check_parser.add_argument(
         "site", help="the folder that MkDocs built the website into, such as site"
@@ -1650,7 +1836,8 @@ def add_pages_parsers(
     site_check_parser.add_argument(
         "--output",
         help="the file of the outputs of the step, $GITHUB_OUTPUT: the further "
-        "languages and the path of the address",
+        "languages, the path of the address, and the rule of lychee for the links of "
+        "llms.txt",
     )
 
 
@@ -1677,6 +1864,7 @@ def parser() -> argparse.ArgumentParser:
         add_changelog_parsers,
         add_update_parsers,
         add_coach_parsers,
+        add_ownership_parser,
         add_bot_health_parsers,
         add_diagrams_parsers,
         add_screenshots_parsers,
@@ -1704,6 +1892,10 @@ def standalone_command(
             return 2
     if arguments.command == "annotate":
         return annotate_command(arguments, root)
+    if arguments.command == "ownership":
+        return ownership_command(arguments, root)
+    if arguments.command == "app":
+        return app_command(arguments, root)
     if arguments.command == "doctor":
         # Git and gh only answer, and the settings play no part in it.
         try:
@@ -1711,15 +1903,19 @@ def standalone_command(
         except CreateError as error:
             print(f"blueprint.py: {error}", file=sys.stderr)
             return 2
-    if arguments.command == "coach" and arguments.action != "report":
+    if arguments.command == "coach" and arguments.action in ("explain", "verify"):
         try:
             return explain_command(arguments, root)
         except (OSError, CatalogError) as error:
             print(f"blueprint.py: {error}", file=sys.stderr)
             return 2
-    if arguments.command == "coach" and not (
-        re.fullmatch(r"[0-9a-f]{40}", arguments.sha)
-        and re.fullmatch(r"[0-9]*", arguments.pull)
+    if (
+        arguments.command == "coach"
+        and arguments.action == "report"
+        and not (
+            re.fullmatch(r"[0-9a-f]{40}", arguments.sha)
+            and re.fullmatch(r"[0-9]*", arguments.pull)
+        )
     ):
         print(
             "blueprint.py: a commit is 40 hex digits, a pull request a number",
@@ -1838,6 +2034,8 @@ def main(
         if arguments.command == "settings" and arguments.action == "actions":
             return actions_command(api, root, arguments.config)
         repo = arguments.repo or current_repo(api)
+        if arguments.command == "coach" and arguments.action == "signatures":
+            return signatures_command(api, repo, arguments)
         if arguments.command == "coach":
             number = int(arguments.pull) if arguments.pull else None
             catalog = Catalog.load(root)
@@ -1872,8 +2070,8 @@ def main(
         if arguments.command == "bot-health":
             return bot_health_command(api, repo, arguments, root)
         if arguments.command == "next-branch":
-            outcome = next_branch(api, repo)
-            for warning in outcome.warnings:
+            outcome = next_branch(api, repo, job_from(os.environ))
+            for warning in (*outcome.warnings, *outcome.notices):
                 print(warning, file=sys.stderr)
             print(outcome.summary, end="")
             return 1 if outcome.warnings and not arguments.warnings_only else 0

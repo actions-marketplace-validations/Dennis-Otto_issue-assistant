@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tomllib
 import urllib.parse
 from glob import iglob as files_matching
@@ -21,8 +22,9 @@ import pytest
 import yaml
 
 import issue_assistant as assistant
+from support import package_source
 
-ROOT = Path(assistant.__file__).parent
+ROOT = assistant.TOOL
 # The workflows that install writes into a repository: the triggers, the permissions
 # and the pin of a reusable workflow of this repository, which has the jobs.
 TEMPLATES = assistant.TEMPLATES / assistant.WORKFLOWS
@@ -66,7 +68,7 @@ TOOL_CHECKOUT = {
         f"/{path}\n"
         for path in (
             "action.yml",
-            "issue_assistant.py",
+            "issue_assistant/",
             "version.txt",
             "prompts/",
             "locales/",
@@ -81,6 +83,8 @@ TOOL_CHECKOUT = {
 # The runner of every job without the AI: a fixed version of Ubuntu, so that a new
 # image behind ubuntu-latest never reaches the repositories untested.
 RUNNER = "ubuntu-24.04"
+# The runners that the Action test runs the action on, the one of the templates first.
+ACTION_RUNNERS = [RUNNER, "ubuntu-26.04", "ubuntu-24.04-arm"]
 HARDEN_RUNNER = "step-security/harden-runner"
 # The hosts that a job without the AI reaches: the checkout and the GitHub CLI.
 # Harden-Runner allows the hosts of the runner itself, such as those of the logs.
@@ -324,6 +328,7 @@ def cli_reads_only(engine, step):
         assert command.count("--allow-tool") == 1
         assert "--disable-builtin-mcps" in command
         assert "--disallow-temp-dir" in command
+        assert "--sync-session=off" in command
         assert "--deny-tool" not in command
 
 
@@ -472,7 +477,7 @@ GUARD = {
 
 def guard_step():
     """The guard of the labels' job; every other job has the same."""
-    return load(reusable("labels.yml"))["jobs"]["sync"]["steps"][1]
+    return step_named(load(reusable("labels.yml"))["jobs"]["sync"], GUARD["name"])
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -569,14 +574,12 @@ def test_the_tool_checkout_holds_what_the_action_reads_and_nothing_more():
     only what the action runs: never the docs and tests of the issue assistant,
     whose texts would only mislead the engine."""
     checked_out = TOOL_CHECKOUT["sparse-checkout"].splitlines()
-    source = (ROOT / "issue_assistant.py").read_text(encoding="utf-8")
     read = {"/action.yml"} | {
-        f"/{path}" for path in re.findall(r"""TOOL / ["']([^"']+)["']""", source)
+        f"/{path}"
+        for path in re.findall(r"""TOOL / ["']([^"']+)["']""", package_source())
     }
     action = (ROOT / "action.yml").read_text(encoding="utf-8")
-    read |= {
-        f"/{path}" for path in re.findall(r"\$GITHUB_ACTION_PATH/(\S+?)\"", action)
-    }
+    read |= {f"/{path}" for path in re.findall(r" -m (\S+) ", action)}
     assert {path.rstrip("/") for path in checked_out} == read
     assert all((ROOT / path.strip("/")).exists() for path in checked_out)
 
@@ -644,21 +647,22 @@ def test_the_ai_runs_on_another_runner_only_behind_harden_runner(name):
     analyze = jobs["analyze"]
     assert analyze["runs-on"] == AI_RUNNER
     assert analyze["needs"] == "event"
-    block, holds, *rest = analyze["steps"]
+    block, holds, warm, *rest = analyze["steps"]
     action, _, ref = block["uses"].partition("@")
     assert action == HARDEN_RUNNER and assistant.SHA.fullmatch(ref)
-    assert block["if"] == holds["if"] == ON_ANOTHER_RUNNER
+    assert block["if"] == holds["if"] == warm["if"] == ON_ANOTHER_RUNNER
     # The engines need sudo, to install what isolates them.
     assert block["with"] == {
         "egress-policy": "block",
         "allowed-endpoints": "${{ needs.event.outputs.endpoints }}",
     }
     assert holds["name"] == "Make sure that the block holds"
+    assert warm["name"] == WARM_UP
     for step in rest:
         assert assistant.RUNNER_VARIABLE not in str(step.get("if", "")), step
         assert not step.get("uses", "").startswith(HARDEN_RUNNER), step
     event = jobs["event"]
-    assert event["steps"][-1] == {
+    assert event["steps"][-2] == {
         "name": "Name the hosts of the firewall policy for the AI's runner",
         "id": "endpoints",
         "if": ON_ANOTHER_RUNNER,
@@ -778,6 +782,229 @@ def test_harden_runner_is_a_version_that_lets_the_allowed_hosts_through(path):
         assert tuple(int(part) for part in pin.groups()) >= HARDEN_RUNNER_FIXED, uses
 
 
+WAIT_FOR_DOCKER = "Wait until Harden-Runner has removed Docker"
+WARM_UP = "Wait until Harden-Runner lets the hosts through"
+# The jobs that block with the hosts of the firewall policy, as the AI does on the
+# runner of ISSUE_ASSISTANT_AI_RUNNER.
+WITH_THE_FIREWALL_POLICY = {
+    ("action-test.yml", "fallback"),
+    ("reusable-discussion-assistant.yml", "analyze"),
+    ("reusable-issue-assistant.yml", "analyze"),
+}
+HARDENED_JOBS = [
+    (path.name, name, job, step)
+    for path in PROJECT_WORKFLOWS
+    for name, job in load(path)["jobs"].items()
+    for step in job.get("steps", [])
+    if step.get("uses", "").startswith(f"{HARDEN_RUNNER}@")
+]
+
+
+def hardened_job_id(item):
+    return f"{item[0]}-{item[1]}"
+
+
+def step_named(job, name):
+    (step,) = [step for step in job["steps"] if step.get("name") == name]
+    return step
+
+
+def test_the_jobs_behind_harden_runner_are_found():
+    found = {(workflow, name) for workflow, name, _, _ in HARDENED_JOBS}
+    # Those that every repository runs, and those of the tests here.
+    assert {
+        ("reusable-findings.yml", "findings"),
+        ("reusable-issue-assistant.yml", "event"),
+        ("reusable-issue-assistant.yml", "apply"),
+        ("reusable-discussion-assistant.yml", "event"),
+        ("reusable-discussion-assistant.yml", "apply"),
+        ("reusable-issue-lifecycle.yml", "sweep"),
+        ("reusable-labels.yml", "sync"),
+        ("action-test.yml", "egress"),
+        ("canary.yml", "start"),
+        ("canary.yml", "queue"),
+        ("workflow-test.yml", "changes"),
+        ("workflow-test.yml", "gate"),
+    } <= found
+    assert found >= WITH_THE_FIREWALL_POLICY
+
+
+@pytest.mark.parametrize("item", HARDENED_JOBS, ids=hardened_job_id)
+def test_every_job_without_docker_waits_until_harden_runner_has_removed_it(item):
+    """Harden-Runner removes Docker with apt-get in the background, and a job that
+    ends before it finishes hangs in "Cleaning up orphan processes" until its timeout,
+    which a short job of a reusable workflow would reach in every repository."""
+    workflow, name, job, block = item
+    names = [step.get("name") for step in job["steps"]]
+    if not block["with"].get("disable-sudo-and-containers"):
+        assert WAIT_FOR_DOCKER not in names, (workflow, name)
+        return
+    wait = step_named(job, WAIT_FOR_DOCKER)
+    assert wait["if"] == "always()", (workflow, name)
+    # It ends the job: the explanation of a failure runs before it, since it needs the
+    # checkout and takes a moment that the removal may use.
+    assert job["steps"][-1] is wait, (workflow, name)
+
+
+@pytest.mark.parametrize("item", HARDENED_JOBS, ids=hardened_job_id)
+def test_every_job_that_blocks_waits_until_harden_runner_lets_its_hosts_through(item):
+    """An address that the runner asked for past Harden-Runner stays in the cache of
+    systemd-resolved for up to a minute, and Harden-Runner blocks it until then, so
+    the first step that needs a host would fail, and the job could hang at its end:
+    https://github.com/step-security/harden-runner/issues/708"""
+    workflow, name, job, block = item
+    names = [step.get("name") for step in job["steps"]]
+    if block["with"]["egress-policy"] != "block":
+        assert WARM_UP not in names, (workflow, name)
+        return
+    warm = step_named(job, WARM_UP)
+    index = job["steps"].index(warm)
+    if (workflow, name) in WITH_THE_FIREWALL_POLICY:
+        # After the step that makes sure of the block, since a request that gets
+        # through before it holds says nothing. Only GitHub's hosts: the runner asked
+        # for no other, and the policy names hosts of engines that this repository may
+        # not use, and one that answers only on port 80, each of which would stop the
+        # AI for two minutes.
+        assert index == job["steps"].index(block) + 2, name
+        assert warm["env"] == {"HOSTS": " ".join(GITHUB_HOSTS)}, name
+    else:
+        # Before every step that could need a host, and for just the hosts that the
+        # job allows, by the same words, so that they can't drift apart.
+        assert index == job["steps"].index(block) + 1, (workflow, name)
+        assert warm["env"] == {"HOSTS": block["with"]["allowed-endpoints"]}, name
+    # It runs just where the block does.
+    assert warm.get("if") == block.get("if"), (workflow, name)
+    # Two minutes, and a last try of 5 s for each host, of a job of 5 minutes.
+    assert warm["timeout-minutes"] == 4, (workflow, name)
+
+
+def test_the_wait_for_docker_and_the_warm_up_are_one_script_each():
+    """So that a fix reaches every job, those of the reusable workflows above all."""
+    for step_name in (WAIT_FOR_DOCKER, WARM_UP):
+        scripts = {
+            step["run"]
+            for _, _, job, _ in HARDENED_JOBS
+            for step in job["steps"]
+            if step.get("name") == step_name
+        }
+        assert len(scripts) == 1, step_name
+
+
+def test_the_firewall_policy_allows_the_hosts_of_the_warm_up():
+    """A host that the job doesn't allow would hold it up for two minutes."""
+    endpoints = assistant.firewall_endpoints(assistant.TEMPLATES).split()
+    assert set(GITHUB_HOSTS) <= set(endpoints)
+
+
+def stand_ins(tmp_path, **scripts):
+    """A PATH with a script for each command, and the file that lists their calls."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    calls = tmp_path / "calls"
+    calls.touch()
+    for command, script in scripts.items():
+        path = folder / command
+        path.write_text(
+            f'#!/bin/sh\necho "{command} $*" >> "{calls.as_posix()}"\n{script}\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        path.chmod(0o755)
+    return f"{folder}{os.pathsep}{os.environ['PATH']}", calls
+
+
+def count_up(counter):
+    """The lines of a stand-in that count its calls in the file `counter`, in `$n`."""
+    counter.write_text("0", encoding="utf-8")
+    path = counter.as_posix()
+    return f'n=$(( $(cat "{path}") + 1 ))\necho "$n" > "{path}"'
+
+
+@pytest.mark.parametrize(("busy", "sleeps"), [(0, 0), (3, 3), (200, 120)])
+def test_the_wait_for_docker_ends_once_apt_get_is_done_or_after_two_minutes(
+    tmp_path, busy, sleeps
+):
+    # pgrep finds apt-get the first times it is asked.
+    path, calls = stand_ins(
+        tmp_path,
+        pgrep=f'{count_up(tmp_path / "count")}\n[ "$n" -le {busy} ]',
+        sleep="",
+    )
+    result, _ = run_step(
+        step_named(JOBS["event"], WAIT_FOR_DOCKER), tmp_path, PATH=path
+    )
+    assert result.returncode == 0, result.stderr
+    asked = calls.read_text(encoding="utf-8").splitlines()
+    assert asked.count("sleep 1") == sleeps
+    assert set(asked) <= {"pgrep -x apt-get|dpkg", "sleep 1"}
+    assert ("::warning::Harden-Runner still removes Docker" in result.stdout) == (
+        busy > 120
+    )
+
+
+def warm_up(tmp_path, blocked):
+    """The warm-up, where curl fails the first `blocked` times that it is asked, and
+    each look at the clock takes 3 s; with what it printed, and the calls."""
+    clock = tmp_path / "clock"
+    clock.write_text("1000", encoding="utf-8")
+    path, calls = stand_ins(
+        tmp_path,
+        curl=f'{count_up(tmp_path / "tries")}\n[ "$n" -gt {blocked} ]',
+        date=(
+            f'now=$(cat "{clock.as_posix()}")\n'
+            f'echo "$((now + 3))" > "{clock.as_posix()}"\n'
+            'echo "$now"'
+        ),
+        sleep="",
+    )
+    result, _ = run_step(
+        step_named(JOBS["event"], WARM_UP),
+        tmp_path,
+        PATH=path,
+        HOSTS="api.github.com:443 *.actions.githubusercontent.com:443 github.com:443",
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout, calls.read_text(encoding="utf-8").splitlines()
+
+
+PROBE = "curl --silent --head --connect-timeout 3 --max-time 5 --output /dev/null "
+
+
+def test_the_warm_up_asks_each_host_once_when_harden_runner_lets_it_through(tmp_path):
+    output, calls = warm_up(tmp_path, 0)
+    # The wildcard names no host to ask.
+    assert [call for call in calls if call.startswith("curl")] == [
+        f"{PROBE}https://api.github.com/",
+        f"{PROBE}https://github.com/",
+    ]
+    assert not any(call.startswith("sleep") for call in calls)
+    assert "::warning::" not in output
+
+
+def test_the_warm_up_asks_again_until_harden_runner_lets_the_host_through(tmp_path):
+    output, calls = warm_up(tmp_path, 3)
+    assert calls.count(f"{PROBE}https://api.github.com/") == 4
+    assert calls.count(f"{PROBE}https://github.com/") == 1
+    assert calls.count("sleep 3") == 3
+    assert output.count("Harden-Runner still blocks api.github.com") == 3
+    assert "::warning::" not in output
+
+
+def test_the_warm_up_warns_after_two_minutes_and_leaves_the_failure_to_the_step(
+    tmp_path,
+):
+    # A host that doesn't answer may be one that this run doesn't need.
+    output, calls = warm_up(tmp_path, 10_000)
+    # At most 40 tries of 3 s for the first host, and then one for each other host.
+    assert calls.count(f"{PROBE}https://api.github.com/") == 40
+    assert calls.count(f"{PROBE}https://github.com/") == 1
+    assert calls.count("sleep 3") == 39
+    for host in ("api.github.com", "github.com"):
+        assert (
+            f"::warning::Harden-Runner still blocks {host} after two minutes" in output
+        )
+
+
 def test_the_action_runs_in_ci_behind_the_block_of_the_templates():
     """The Action test runs the action behind the egress block of the templates.
 
@@ -796,7 +1023,7 @@ def test_the_action_runs_in_ci_behind_the_block_of_the_templates():
         and not name.startswith("fallback")
         and name not in {"engines", "schema-refresh"}
     ]
-    assert job["runs-on"] == RUNNER
+    assert job["runs-on"] == "${{ matrix.runner }}"
     assert job["steps"][0] == JOBS["event"]["steps"][0]
     runs = [step["with"] for step in job["steps"] if step.get("uses") == "./"]
     # Dry runs of the commands that read the most of GitHub, which only read.
@@ -806,7 +1033,7 @@ def test_the_action_runs_in_ci_behind_the_block_of_the_templates():
     ]
     # And context, which only reads, for a real issue among issues and discussions.
     (context,) = [step for step in job["steps"] if " context " in step.get("run", "")]
-    assert context["run"].startswith("python3 issue_assistant.py context --issue ")
+    assert context["run"].startswith("python3 -m issue_assistant context --issue ")
     assert context["env"]["GH_TOKEN"] == "${{ github.token }}"
     # A token that can only read, so that a write which a dry run let through fails.
     assert job["permissions"] == {
@@ -815,6 +1042,68 @@ def test_the_action_runs_in_ci_behind_the_block_of_the_templates():
         "issues": "read",
         "pull-requests": "read",
     }
+
+
+@pytest.mark.parametrize(
+    ("key", "name"),
+    [("action", "action"), ("egress", "action behind the egress block")],
+)
+def test_the_action_test_runs_the_action_on_every_supported_runner(key, name):
+    """People call the action from their own jobs, also on ubuntu-latest and on the
+    free ARM runners. The leg on the runner of the templates keeps the name of the
+    job, which main may require, and a failure on one runner cancels no other leg."""
+    job = load(OWN / "action-test.yml")["jobs"][key]
+    assert job["name"] == "${{ matrix.check }}"
+    assert job["runs-on"] == "${{ matrix.runner }}"
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"]["include"] == [
+        {"runner": runner, "check": name if runner == RUNNER else f"{name} ({runner})"}
+        for runner in ACTION_RUNNERS
+    ]
+
+
+def test_the_leg_on_the_runner_of_the_templates_keeps_the_required_check():
+    assert "action" in SETTINGS["branch"]["required_checks"]
+    legs = load(OWN / "action-test.yml")["jobs"]["action"]["strategy"]["matrix"]
+    assert legs["include"][0] == {"runner": RUNNER, "check": "action"}
+
+
+def test_every_leg_runs_check_with_yq_and_without_pyyaml():
+    """check prefers PyYAML, so only a job that hides it runs each image's real yq."""
+    job = load(OWN / "action-test.yml")["jobs"]["action"]
+    steps = {step.get("id"): step for step in job["steps"]}
+    step = steps["sample-check-yq"]
+    assert step["uses"] == "./"
+    assert step["with"]["command"] == "check"
+    assert "matrix.runner" not in step["if"]
+    assert step["env"]["PYTHONPATH"] == "${{ runner.temp }}/no-pyyaml"
+    install = steps["sample-install"]["run"]
+    assert "no-pyyaml/yaml.py" in install and "raise ImportError" in install
+    failed = next(
+        step["env"]["FAILED"]
+        for step in job["steps"]
+        if step.get("name") == "Explain the failure"
+    )
+    assert "steps.sample-check-yq.outcome == 'failure'" in failed
+
+
+def test_only_one_leg_lints_the_templates():
+    """What actionlint and zizmor find doesn't depend on the runner, so the other
+    legs run only what can differ, as quickly as they can."""
+    steps = load(OWN / "action-test.yml")["jobs"]["action"]["steps"]
+    lints = [step for step in steps if step.get("id", "").startswith("template-")]
+    assert len(lints) == 2
+    only_on_one = f"matrix.runner == '{RUNNER}'"
+    assert all(only_on_one in step["if"] for step in lints)
+    others = [step for step in steps if step not in lints and "if" in step]
+    assert others and not any(only_on_one in step["if"] for step in others)
+
+
+def test_the_readme_names_the_runners_that_the_action_test_runs_on():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    (section,) = re.findall(r"^## Supported runners\n(.+?)^## ", readme, re.M | re.S)
+    table = re.findall(r"^\| `([^`]+)`", section, re.MULTILINE)
+    assert table == ACTION_RUNNERS
 
 
 def test_the_block_of_the_ai_s_runner_in_reserve_runs_in_ci():
@@ -1139,7 +1428,7 @@ def test_the_canary_runs_every_week_and_after_every_change_of_its_path():
     paths = triggers["push"]["paths"]
     for path in (
         "action.yml",
-        "issue_assistant.py",
+        "issue_assistant/**",
         "prompts/**",
         f"{assistant.WORKFLOWS}/{assistant.REUSABLE_PREFIX}issue-assistant.yml",
         f"templates/{assistant.FIREWALL}",
@@ -1152,8 +1441,9 @@ def test_the_canary_runs_every_week_and_after_every_change_of_its_path():
 
 
 def start_script():
-    (script,) = [s["run"] for s in CANARY["jobs"]["start"]["steps"] if "run" in s]
-    return script
+    return step_named(
+        CANARY["jobs"]["start"], "Start the canary and wait for its result"
+    )["run"]
 
 
 # The GitHub CLI of the job start, as a shell function: it notes its arguments and
@@ -1242,7 +1532,7 @@ def test_the_canary_s_issue_is_one_that_this_repository_could_get():
 
 def test_the_github_cli_sends_no_telemetry():
     # Its telemetry would only knock at a host that the block doesn't allow.
-    (step,) = ACTION["runs"]["steps"]
+    step = ACTION["runs"]["steps"][-1]
     assert step["env"]["GH_TELEMETRY"] == "false"
 
 
@@ -1306,12 +1596,185 @@ def test_untrusted_text_never_reaches_a_shell_script(path):
 
 
 def test_the_action_passes_every_input_through_the_environment():
-    (step,) = ACTION["runs"]["steps"]
-    assert step["run"] == 'python3 "$GITHUB_ACTION_PATH/issue_assistant.py" "$COMMAND"'
+    step = ACTION["runs"]["steps"][-1]
+    assert step["run"] == (
+        'PYTHONPATH="$GITHUB_ACTION_PATH${PYTHONPATH:+:$PYTHONPATH}" '
+        'python3 -P -B -m issue_assistant "$COMMAND"'
+    )
     inputs = {f"${{{{ inputs.{name} }}}}" for name in ACTION["inputs"]}
     assert inputs <= set(step["env"].values())
     for name, output in ACTION["outputs"].items():
         assert output["value"] == f"${{{{ steps.run.outputs.{name} }}}}"
+
+
+# How the action says that the Python of the runner is too old or missing.
+NEEDS_PYTHON = "::error::The issue assistant needs Python 3.12 or newer, and "
+HOW_TO_FIX_THE_PYTHON = (
+    " Run the job on a runner with a newer one, such as runs-on: ubuntu-24.04, or add "
+    "actions/setup-python with python-version: 3.12 before this step.\n"
+)
+
+
+def fake_python(folder, version):
+    """A python3 in folder that reports this version, to the guard of the action. It
+    runs what the guard asks on the real Python, whose version it replaces."""
+    folder.mkdir(exist_ok=True)
+    python = Path(sys.executable).as_posix()
+    replaced = f"sys.version_info = ({version.replace('.', ', ')}, 'final', 0)"
+    fake = folder / "python3"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = --version ]; then echo "Python {version}"; exit 0; fi\n'
+        f'exec "{python}" -c "import sys; {replaced}; exec(sys.argv[1])" "$2"\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    return folder
+
+
+def run_the_guard(folder):
+    (guard, _) = ACTION["runs"]["steps"]
+    return subprocess.run(
+        [shutil.which("bash"), "-e", "-c", guard["run"]],
+        env={**os.environ, "PATH": str(folder)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_the_action_checks_the_python_before_it_runs_the_script():
+    """A failed step of a composite action stops the steps after it, unless one of
+    them asks otherwise; so the script never starts on a Python that it doesn't
+    support, where a check inside the script would come too late."""
+    (guard, script) = ACTION["runs"]["steps"]
+    assert guard["id"] == "python" and guard["shell"] == "bash"
+    assert "continue-on-error" not in guard
+    assert "if" not in script
+    assert "issue_assistant" not in guard["run"]
+    # It takes no input, so no value of an issue or a repository reaches its text.
+    assert "${{" not in guard["run"] and "env" not in guard
+
+
+def test_the_python_of_the_guard_is_the_one_that_the_script_targets():
+    """Decision 0003: the version that ruff and mypy check the script for."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    major, minor = project["tool"]["mypy"]["python_version"].split(".")
+    (guard, _) = ACTION["runs"]["steps"]
+    assert f"sys.version_info < ({major}, {minor})" in guard["run"]
+    assert NEEDS_PYTHON.removeprefix("::error::").startswith(
+        f"The issue assistant needs Python {major}.{minor} or newer"
+    )
+    assert f"python-version: {major}.{minor}" in HOW_TO_FIX_THE_PYTHON
+
+
+@pytest.mark.parametrize("version", ["3.12.0", "3.14.4"])
+def test_the_guard_lets_a_python_that_is_new_enough_pass(tmp_path, version):
+    result = run_the_guard(fake_python(tmp_path / "bin", version))
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+
+
+@pytest.mark.parametrize("version", ["3.11.9", "3.10.12", "3.8.10"])
+def test_the_guard_names_a_python_that_is_too_old_and_how_to_fix_it(tmp_path, version):
+    result = run_the_guard(fake_python(tmp_path / "bin", version))
+    assert result.returncode == 1
+    assert result.stdout == (
+        f"{NEEDS_PYTHON}python3 on this runner is Python {version}."
+        f"{HOW_TO_FIX_THE_PYTHON}"
+    )
+    assert result.stderr == ""
+
+
+def test_the_guard_says_so_when_the_runner_has_no_python(tmp_path):
+    (tmp_path / "bin").mkdir()
+    result = run_the_guard(tmp_path / "bin")
+    assert result.returncode == 1
+    assert result.stdout == (
+        f"{NEEDS_PYTHON}this runner has no python3.{HOW_TO_FIX_THE_PYTHON}"
+    )
+    assert result.stderr == ""
+
+
+def old_python_job():
+    return load(OWN / "action-test.yml")["jobs"]["old-python"]
+
+
+def test_the_action_test_runs_the_action_on_a_python_that_is_too_old():
+    """The real action on the real Python 3.11, which must fail in its first step."""
+    job = old_python_job()
+    assert job["runs-on"] == RUNNER
+    uses = [step.get("uses", "").split("@")[0] for step in job["steps"]]
+    setup = uses.index("actions/setup-python")
+    action = uses.index("./")
+    assert uses.index("actions/checkout") < setup < action
+    assert job["steps"][setup]["with"] == {"python-version": "3.11"}
+    refused = job["steps"][action]
+    # Only the next step decides, so that the action failing is what makes it pass.
+    assert refused["continue-on-error"] is True
+    assert refused["with"] == {"command": "check"}
+    verified = job["steps"][action + 1]
+    assert verified["env"]["OUTCOME"] == f"${{{{ steps.{refused['id']}.outcome }}}}"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "version", "guard", "error"),
+    [
+        ("failure", "3.11.9", None, None),
+        ("success", "3.11.9", None, "The action ran on Python 3.11"),
+        ("failure", "3.12.0", None, "let Python 3.12.0 through"),
+        ("failure", "3.10.12", None, "doesn't name Python 3.11"),
+        ("failure", "3.11.9", "echo Traceback; exit 1", "doesn't name Python 3.11"),
+        (
+            "failure",
+            "3.11.9",
+            'echo "::error::Python 3.11.9"; echo Traceback >&2; exit 1',
+            "traceback",
+        ),
+    ],
+)
+def test_the_job_on_the_old_python_passes_only_with_the_message(
+    tmp_path, outcome, version, guard, error
+):
+    """It reads the check out of action.yml, so that it runs what the action runs."""
+    folder = fake_python(tmp_path / "bin", version)
+    (real, _) = ACTION["runs"]["steps"]
+    (tmp_path / "guard").write_text(guard or real["run"], encoding="utf-8")
+    fake_yq = folder / "yq"
+    fake_yq.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = \'.runs.steps[] | select(.id == "python") | .run\' ] '
+        '&& [ "$2" = action.yml ]; then\n'
+        f'  cat "{(tmp_path / "guard").as_posix()}"\n'
+        "else\n"
+        "  exit 2\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_yq.chmod(0o755)
+    (step,) = [
+        step for step in old_python_job()["steps"] if "OUTCOME" in step.get("env", {})
+    ]
+    result = subprocess.run(
+        [shutil.which("bash"), "-e", "-c", step["run"]],
+        env={
+            **os.environ,
+            "OUTCOME": outcome,
+            "PATH": os.pathsep.join([str(folder), os.environ["PATH"]]),
+            "RUNNER_TEMP": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if error is None:
+        assert result.returncode == 0, result.stdout + result.stderr
+        # The message shows in the log, and only the action makes it an annotation.
+        assert "> ::error::" in result.stdout
+        assert "\n::error::" not in f"\n{result.stdout}"
+    else:
+        assert result.returncode == 1
+        (message,) = re.findall(r"^::error::(.+)$", result.stdout, re.MULTILINE)
+        assert error in message
 
 
 def test_every_engine_has_rules_a_step_and_credentials():
@@ -1417,12 +1880,9 @@ def test_the_docs_install_the_command_lines_from_their_lock_files():
         text = path.read_text(encoding="utf-8")
         assert "engines/" in text and "npm ci" in text, name
     # The decision record tells the history of the input, the others its present.
-    for path in [
-        *list(pages.values())[:3],
-        ROOT / "action.yml",
-        ROOT / "issue_assistant.py",
-    ]:
+    for path in [*list(pages.values())[:3], ROOT / "action.yml"]:
         assert "engine-version" not in path.read_text(encoding="utf-8"), path.name
+    assert "engine-version" not in package_source()
     assert "ENGINE_VERSION" not in (ROOT / "action.yml").read_text(encoding="utf-8")
 
 
@@ -1667,7 +2127,7 @@ def test_merges_and_releases_start_the_lifecycle_without_running_pull_request_co
         "issues": "write",
         "pull-requests": "read",
     }
-    _, guard, checkout, tool, step = job["steps"]
+    _, _, guard, checkout, tool, step, _ = job["steps"]
     assert guard["name"] == GUARD["name"]
     # The default branch: no ref of the pull request, no credentials left behind.
     assert checkout["with"] == {"persist-credentials": False}
@@ -1700,7 +2160,7 @@ def test_the_findings_workflow_may_only_dismiss_alerts_and_runs_no_ai():
     # Only code scanning of the default branch of this repository, never of a fork.
     assert "head_repository.full_name == github.repository" in condition
     assert "head_branch == github.event.repository.default_branch" in condition
-    _, guard, checkout, tool, step = job["steps"]
+    _, _, guard, checkout, tool, step, _ = job["steps"]
     assert guard["name"] == GUARD["name"]
     assert checkout["with"] == {"persist-credentials": False}
     assert tool["with"] == TOOL_CHECKOUT and step["uses"] == TOOL
@@ -1759,7 +2219,7 @@ VENDORS = re.compile(r"Claude|Anthropic|OpenAI|Codex|Copilot|GPT|Gemini", re.IGN
 
 @pytest.mark.mutation_unsafe
 def test_only_the_engine_table_names_a_vendor():
-    source = (ROOT / "issue_assistant.py").read_text(encoding="utf-8")
+    source = package_source()
     table = re.search(r"^ENGINES = \{.*?\}$", source, re.MULTILINE | re.DOTALL)
     assert table and VENDORS.search(table[0])
     rest = re.sub(

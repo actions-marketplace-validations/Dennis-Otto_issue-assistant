@@ -335,12 +335,29 @@ if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
   report="$(mktemp)"
   junit=("--junitxml=$report" -o junit_family=xunit1)
 fi
+# On a Linux runner, the temporary folders of the tests live in memory when at least
+# 4 GB are free there: tests that make many folders and start many processes take less
+# time than on the disk of the runner. Not in a job in a container, whose /dev/shm has
+# 64 MB, not on the machine of a contributor, and not where a TMPDIR is set already. A
+# project whose tests write more than that names a folder on the disk with --basetemp
+# in the addopts of pytest in pyproject.toml, which is its own file. Only for the tests:
+# what a later step writes stays on the disk.
+memory=""
+if [[ "${GITHUB_ACTIONS:-}" == true && -z "${TMPDIR:-}" && "$(uname -s)" == Linux ]]; then
+  memory="$(df -k --output=avail /dev/shm 2>/dev/null | tail -n 1 || true)"
+fi
+if ((${memory:-0} >= 4194304)); then
+  export TMPDIR=/dev/shm
+fi
 status=0
 if python -c 'import pytest, pytest_cov, xdist' 2>/dev/null; then
   python -m pytest -n logical --maxprocesses="${PYTEST_XDIST_AUTO_NUM_WORKERS:-8}" \
     ${junit[@]+"${junit[@]}"} --cov --cov-report= --cov-fail-under=0 || status=$?
 else
   coverage run -m pytest ${junit[@]+"${junit[@]}"} || status=$?
+fi
+if ((${memory:-0} >= 4194304)); then
+  unset TMPDIR
 fi
 if ((status != 0)); then
   if [[ -n "$report" ]]; then
@@ -349,6 +366,31 @@ if ((status != 0)); then
   exit "$status"
 fi
 coverage report
+
+# The tests of the accessibility check of the website, which the blueprint alone keeps:
+# .github/a11y/check.mjs in a real Chrome, with every line and branch of it covered. They
+# need Node 24, as the check docs has it, for the limits of the coverage; check (python)
+# sets it up.
+if [[ -f .github/a11y/check.test.mjs ]]; then
+  step "Accessibility check"
+  node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+  if ((${node_major:-0} < 24)); then
+    echo "Node 24 or newer is not installed here; the CI tests the accessibility check."
+  else
+    npm ci --prefix .github/a11y --ignore-scripts --no-audit --no-fund --silent
+    if node --input-type=module -e 'const { launch } = await import("./.github/a11y/check.mjs"); await (await launch()).close();' 2>/dev/null; then
+      node --test --experimental-test-coverage \
+        --test-coverage-include=.github/a11y/check.mjs \
+        --test-coverage-lines=100 --test-coverage-branches=100 \
+        .github/a11y/check.test.mjs
+    elif [[ -n "${CI:-}" ]]; then
+      echo "The tests of the accessibility check need a Chrome, which doesn't start on this runner."
+      exit 1
+    else
+      echo "Chrome doesn't start here; the CI tests the accessibility check."
+    fi
+  fi
+fi
 
 step "Website"
 # The website of the Docs workflow, built strictly as the check docs builds it, so
@@ -389,6 +431,12 @@ else
       # build, with the Python and blueprint.py of the step Pages in one column.
       if [[ -n "${python:-}" && -f "${tool:-}" ]] && ! "$python" "$tool" site-check "$site"; then
         echo "The website breaks what its hooks promise; the lines above name each file."
+        exit 1
+      fi
+      # The checks of this project alone on its website, as the check docs runs them
+      # after the build, here with the folder of this build.
+      if [[ -f scripts/check-site.sh ]] && ! bash scripts/check-site.sh "$site"; then
+        echo "The website fails the checks of this project in scripts/check-site.sh; the lines above say which."
         exit 1
       fi
     )

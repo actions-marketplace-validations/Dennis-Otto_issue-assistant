@@ -21,7 +21,7 @@ In the root of your repository, these commands install the workflows of the late
 tag="$(gh release view --repo Dennis-Otto/issue-assistant --json tagName --jq .tagName)"
 dir="$(mktemp -d)"
 git clone --quiet --depth 1 --branch "$tag" https://github.com/Dennis-Otto/issue-assistant "$dir" &&
-  python3 "$dir/issue_assistant.py" install --setup
+  PYTHONPATH="$dir" python3 -P -m issue_assistant install --setup
 ```
 
 Then describe the project, clear one setting and try it on an issue, as [Set up a repository](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/getting-started.md#set-up-a-repository) shows. [Requirements](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/getting-started.md#requirements) lists what it needs, and the [FAQ](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/faq.md#what-does-it-cost) what it costs.
@@ -133,6 +133,18 @@ The footer of every comment of the AI already links the issue assistant, unless 
 ```markdown
 [![issues: triaged by issue assistant](https://img.shields.io/badge/issues-triaged%20by%20issue%20assistant-blue)](https://dennis-otto.github.io/issue-assistant/)
 ```
+
+## Supported runners
+
+The workflows that `install` writes choose their own runners: `ubuntu-24.04`, and `ubuntu-24.04-firewall` for the AI. A job of your own that calls the action, such as the one that runs [`check`](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/getting-started.md#keep-it-checked), runs on any of these; every pull request here tests the action on each:
+
+| Runner | Python | What it is |
+| --- | --- | --- |
+| `ubuntu-24.04` | 3.12 | The runner of the workflows |
+| `ubuntu-26.04` | 3.14 | What `ubuntu-latest` means since 2026-10-19 |
+| `ubuntu-24.04-arm` | 3.12 | ARM, free in public repositories |
+
+The action needs Python 3.12 or newer as `python3`, with `gh` and `git`; `check` also reads YAML with PyYAML or `yq`. On an older Python, such as on `ubuntu-22.04`, on a self-hosted runner or after `actions/setup-python` with an older version, the action stops in its first step with an error that names the version it found and the fix: run the job on `ubuntu-24.04`, or add `actions/setup-python` with `python-version: 3.12` before the action.
 
 ## Development
 

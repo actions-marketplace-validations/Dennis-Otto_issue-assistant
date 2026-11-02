@@ -38,7 +38,7 @@ _spec.loader.exec_module(contract)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "engines"
 GEMINI_HELP = (FIXTURES / "gemini-0.64.0.help").read_text(encoding="utf-8")
-COPILOT_HELP = (FIXTURES / "copilot-1.0.97.help").read_text(encoding="utf-8")
+COPILOT_HELP = (FIXTURES / "copilot-1.0.103.help").read_text(encoding="utf-8")
 CODEX_HELP = (FIXTURES / "codex-exec-0.162.1.help").read_text(encoding="utf-8")
 ACTION_TEST = yaml.safe_load(
     (ROOT / ".github" / "workflows" / "action-test.yml").read_text(encoding="utf-8")
@@ -125,7 +125,7 @@ def test_the_job_checks_the_engines_on_a_change_of_one_and_every_week():
     # No secret: the job reads GitHub with its own token, which can only read.
     assert job["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert "secrets." not in json.dumps(job)
-    block, checkout = job["steps"][:2]
+    block, warm_up, checkout = job["steps"][:3]
     assert block["uses"].startswith("step-security/harden-runner@")
     # GitHub for the files of the actions and the schemas, npm for the command
     # lines, and Sigstore's root of trust, with which npm verifies the attestations
@@ -135,6 +135,7 @@ def test_the_job_checks_the_engines_on_a_change_of_one_and_every_week():
         "allowed-endpoints": "api.github.com:443 github.com:443 "
         "registry.npmjs.org:443 tuf-repo-cdn.sigstore.dev:443",
     }
+    assert warm_up["env"] == {"HOSTS": block["with"]["allowed-endpoints"]}
     assert checkout["with"] == {"persist-credentials": False}
     steps = {step.get("id"): step for step in job["steps"]}
     assert steps["changes"]["if"].endswith("github.event_name == 'pull_request' }}")
@@ -549,10 +550,11 @@ def test_a_value_that_a_flag_no_longer_takes_fails():
         "[possible values: on, off]", "[possible values: on]"
     )
     flags = contract.passed_flags(command_line("copilot"))
-    (problem,) = contract.flag_problems(
-        "copilot", flags, contract.help_options(changed)
-    )
-    assert problem == "copilot takes no off for --stream, only on"
+    problems = contract.flag_problems("copilot", flags, contract.help_options(changed))
+    assert problems == [
+        "copilot takes no off for --stream, only on",
+        "copilot takes no off for --sync-session, only on",
+    ]
 
 
 # ---------------------------------------------------------------- the settings
@@ -803,7 +805,9 @@ def test_check_cli_fails_without_the_schema_of_the_settings(monkeypatch, tmp_pat
     monkeypatch.setattr(contract, "help_of", lambda command, home: GEMINI_HELP)
     monkeypatch.setattr(contract, "settings_schema", lambda pin, path: None)
     monkeypatch.setattr(
-        assistant, "run_cli", lambda *arguments: completed(GEMINI_WITHOUT_KEY, code=41)
+        assistant,
+        "run_cli",
+        lambda *arguments: completed(GEMINI_WITHOUT_KEY, code=41),
     )
     _, (problem,) = contract.check_cli(GEMINI_PIN, tmp_path)
     assert problem.startswith(
@@ -825,9 +829,11 @@ def test_check_cli_checks_every_effort_and_no_settings_of_copilot(
     monkeypatch.setattr(contract, "help_of", lambda command, home: COPILOT_HELP)
     printed = "Error: No authentication information found. Set COPILOT_GITHUB_TOKEN."
     monkeypatch.setattr(
-        assistant, "run_cli", lambda *arguments: completed(stderr=printed, code=1)
+        assistant,
+        "run_cli",
+        lambda *arguments: completed(stderr=printed, code=1),
     )
-    pin = contract.Pin("copilot", "@github/copilot", "1.0.97")
+    pin = contract.Pin("copilot", "@github/copilot", "1.0.103")
     checked, problems = contract.check_cli(pin, tmp_path)
     assert problems == []
     assert checked == (
@@ -842,7 +848,7 @@ def test_check_cli_checks_every_effort_and_no_settings_of_copilot(
     )
     _, (problem,) = contract.check_cli(pin, tmp_path / "again")
     assert problem == (
-        "@github/copilot@1.0.97 takes no max, xhigh for --reasoning-effort, only "
+        "@github/copilot@1.0.103 takes no max, xhigh for --reasoning-effort, only "
         "high, low, medium, minimal, none"
     )
     # A problem of the lock file comes first.
@@ -1173,7 +1179,7 @@ def test_clis_runs_no_engine_with_a_key(monkeypatch):
     ("files", "runs"),
     [
         (".github/workflows/reusable-discussion-assistant.yml\nREADME.md\n", "true"),
-        ("issue_assistant.py\n", "true"),
+        ("issue_assistant/cli.py\n", "true"),
         ("engines/copilot/package-lock.json\n", "true"),
         ("README.md\ndocs/security.md\n", "false"),
     ],
@@ -1267,7 +1273,7 @@ def placed(monkeypatch):
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(assistant, "as_root", run)
+    monkeypatch.setattr(assistant.running, "as_root", run)
     return commands
 
 

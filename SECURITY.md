@@ -27,7 +27,7 @@ If a fix needs longer, for example because the cause lies in an upstream project
 
 ## Scope
 
-In scope are the action (`action.yml`, `issue_assistant.py`), its prompts, the workflow and firewall templates, and the CI and release workflows of this repository.
+In scope are the action (`action.yml`, `issue_assistant/`), its prompts, the workflow and firewall templates, and the CI and release workflows of this repository.
 
 Out of scope, and reported to their own projects instead: the Claude Code action and Claude Code (<https://github.com/anthropics/claude-code-action/security>), GitHub Actions and its egress firewall (<https://bounty.github.com>).
 
@@ -41,7 +41,7 @@ The action stores no secrets. A repository keeps the engine's token as a secret 
 - Actions are pinned to commit hashes, only those of GitHub and of a list in the settings as code may run, tokens get the least permissions they need, and Renovate keeps actions, dependencies and images current, with the updates that fix a vulnerability at once.
 - OSV-Scanner checks every lock file against the OSV database of known vulnerabilities: in every pull request that changes a lock file, after every change of `main` and every week.
 - Harden-Runner records the network traffic of every job of the workflows, so that a connection that doesn't belong there shows, and blocks it in every job that holds a secret, an OIDC token or a token that may write, such as those with the private key of the release app or the signing key of a Nextcloud app: such a job reaches only the hosts that it needs, each named in the job, and runs without `sudo` and Docker where it needs neither. Such a job first waits until Harden-Runner lets its hosts through, because of [a bug on some of GitHub's runners](https://github.com/step-security/harden-runner/issues/708), and one that hangs until its time limit runs once more; the block stays on. The GitHub CLI of the workflows sends no telemetry.
-- Releases carry SBOMs of what they ship, under their name and version, as SPDX and as CycloneDX, the licenses of their third-party components (`THIRD_PARTY_NOTICES.md`), an OpenVEX document of the advisories that the project accepts with their reasons, and the signed provenance of an isolated build (SLSA Build Level 3); their tags are signed without a key by the release workflow (gitsign), which builds no release on a tag that it didn't sign; they are immutable once published and are verified as their users can after every release and every week.
+- Releases carry SBOMs of what they ship, under their name and version, as SPDX and as CycloneDX, the licenses of their third-party components (`THIRD_PARTY_NOTICES.md`), an OpenVEX document of the advisories that the project accepts with their reasons, and the signed provenance of an isolated build (SLSA Build Level 3); their tags are signed without a key by the release workflow (gitsign), which builds no release on a tag that it didn't sign; they are immutable once published and are verified as their users can after every release, every week and at once when anybody but the release workflow publishes one.
 
 ## Findings of code scanning
 
@@ -54,8 +54,10 @@ A release is immutable once it is published, and GitHub signs an attestation of 
 ```sh
 gh release verify vX.Y.Z --repo Dennis-Otto/issue-assistant
 gh release download vX.Y.Z --repo Dennis-Otto/issue-assistant --pattern '<asset>'
-gh attestation verify <asset> --repo Dennis-Otto/issue-assistant --signer-workflow Dennis-Otto/issue-assistant/.github/workflows/build-release.yml
+gh attestation verify <asset> --repo Dennis-Otto/issue-assistant --signer-workflow Dennis-Otto/issue-assistant/.github/workflows/build-release.yml --source-ref refs/heads/main --deny-self-hosted-runners
 ```
+
+`--signer-workflow` accepts only the provenance of the workflow that builds the release, `--source-ref` only that of a run for `main`, the only branch whose runs make releases, and `--deny-self-hosted-runners` only that of a runner of GitHub: an attestation that another workflow, another branch or a machine of someone else made for this repository fails.
 
 Every asset of a release carries this provenance, those that the project builds itself with `scripts/release-assets.sh`, such as the zip of a browser extension, too.
 
@@ -87,7 +89,7 @@ An attacker would most likely try to bring malicious code into `main`, through a
 
 ### Trust boundaries
 
-1. **Outside contributors → pull requests.** Their code is untrusted. The workflows of their pull requests run only after the maintainer approves them, with a read-only token and without secrets.
+1. **Outside contributors → pull requests.** Their code is untrusted. The workflows of their pull requests run only after the maintainer approves them, with a read-only token and without secrets; the branch bot approves only a head that it made itself on top of commits that the maintainer approved, which runs nothing new.
 2. **Pull requests → `main`.** A change reaches `main` only through a pull request that passes every required check, squashed into one signed commit; nobody can push to `main` directly, force-push it or delete it. The rules of `main` and of the release tags have no exceptions, not even for administrators, but one: only the release app may create a release tag, which the release workflow signs.
 3. **`main` → secrets.** Every secret lives in an environment that only workflows on `main` can use, and the jobs that use one run no code of a pull request.
 4. **Third-party code → the build.** Dependencies are pinned by version and hash, actions by commit hash and images by digest. An update waits a week after its release, unless it fixes a vulnerability, and passes the same checks as every other change. Updates of the [blueprint](https://github.com/Dennis-Otto/repo-blueprint) come only from a release that is immutable, on the blueprint's `main` and signed by its release workflow, which the blueprint bot verifies first; the workflows of the [issue assistant](https://github.com/Dennis-Otto/issue-assistant) come with them, from a release of the issue assistant that the blueprint verified the same way.

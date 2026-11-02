@@ -74,6 +74,29 @@ jobs:
           allowed-endpoints: >-
             api.github.com:443
             github.com:443
+      - name: Wait until Harden-Runner lets the hosts through
+        # The runner may have asked for an address past Harden-Runner, which then blocks
+        # that address for as long as systemd-resolved keeps it, up to a minute.
+        timeout-minutes: 4
+        env:
+          HOSTS: >-
+            api.github.com:443
+            github.com:443
+        run: |
+          deadline=$(($(date +%s) + 120))
+          for endpoint in $HOSTS; do
+            host="${endpoint%:*}"
+            # A wildcard names no host to ask.
+            [[ "$host" == '*.'* ]] && continue
+            until curl --silent --head --connect-timeout 3 --max-time 5 --output /dev/null "https://$host/"; do
+              if (($(date +%s) >= deadline)); then
+                echo "::warning::Harden-Runner still blocks $host after two minutes; a step that needs it will fail, and the job can run again."
+                break
+              fi
+              echo "Harden-Runner still blocks $host, waiting 3 s."
+              sleep 3
+            done
+          done
       # The checkouts below take the issue assistant of the commit of this workflow,
       # which GitHub names in the context of the job. Without one, actions/checkout
       # would take the caller's own repository at its default branch, and the job
@@ -106,7 +129,7 @@ jobs:
           # docs and tests of the issue assistant would only mislead it there.
           sparse-checkout: |
             /action.yml
-            /issue_assistant.py
+            /issue_assistant/
             /version.txt
             /prompts/
             /locales/
@@ -134,6 +157,16 @@ jobs:
           ISSUE_ASSISTANT_AI_RUNNER: ${{ vars.ISSUE_ASSISTANT_AI_RUNNER }}
         with:
           command: endpoints
+      - name: Wait until Harden-Runner has removed Docker
+        # Harden-Runner removes Docker with apt-get in the background; a job that ends
+        # before it finishes hangs in "Cleaning up orphan processes" until its timeout.
+        if: always()
+        run: |
+          for _ in {1..120}; do
+            pgrep -x 'apt-get|dpkg' >/dev/null || exit 0
+            sleep 1
+          done
+          echo "::warning::Harden-Runner still removes Docker after two minutes; the job may hang until its timeout."
 
   analyze:
     name: Analyze with the AI engine
@@ -196,6 +229,33 @@ jobs:
             [ "$failures" -ge 2 ] || sleep 5
           done
           echo "Harden-Runner blocks example.com, a host outside .github/egress-firewall.yaml."
+      - name: Wait until Harden-Runner lets the hosts through
+        if: vars.ISSUE_ASSISTANT_AI_RUNNER != '' && vars.ISSUE_ASSISTANT_AI_RUNNER != 'ubuntu-24.04-firewall'
+        # Only the hosts that the next steps need first, and that the runner may have
+        # asked for past Harden-Runner, which then blocks such an address for as long as
+        # systemd-resolved keeps it, up to a minute. The policy also names hosts of the
+        # engines that this repository may not use, and a mirror that answers only on
+        # port 80; waiting for those would hold up the AI for two minutes.
+        timeout-minutes: 4
+        env:
+          HOSTS: >-
+            api.github.com:443
+            github.com:443
+        run: |
+          deadline=$(($(date +%s) + 120))
+          for endpoint in $HOSTS; do
+            host="${endpoint%:*}"
+            # A wildcard names no host to ask.
+            [[ "$host" == '*.'* ]] && continue
+            until curl --silent --head --connect-timeout 3 --max-time 5 --output /dev/null "https://$host/"; do
+              if (($(date +%s) >= deadline)); then
+                echo "::warning::Harden-Runner still blocks $host after two minutes; a step that needs it will fail, and the job can run again."
+                break
+              fi
+              echo "Harden-Runner still blocks $host, waiting 3 s."
+              sleep 3
+            done
+          done
       # The checkouts below take the issue assistant of the commit of this workflow,
       # which GitHub names in the context of the job. Without one, actions/checkout
       # would take the caller's own repository at its default branch, and the job
@@ -224,7 +284,7 @@ jobs:
           # docs and tests of the issue assistant would only mislead it there.
           sparse-checkout: |
             /action.yml
-            /issue_assistant.py
+            /issue_assistant/
             /version.txt
             /prompts/
             /locales/
@@ -262,7 +322,7 @@ jobs:
       - name: Analyze with Claude
         id: claude
         if: steps.engine.outputs.ready == 'true' && steps.engine.outputs.engine == 'claude'
-        uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
+        uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1.0.262
         env:
           DISABLE_TELEMETRY: "1"
           DISABLE_ERROR_REPORTING: "1"
@@ -305,7 +365,7 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           # renovate: datasource=npm depName=@openai/codex
-          codex-version: "0.163.0"
+          codex-version: "0.164.0"
           # Issues come from people without write access. The sandbox of the
           # profile :read-only lets Codex read files but neither write them nor
           # reach the network, and drop-sudo leaves the API key to the proxy of the
@@ -374,6 +434,29 @@ jobs:
           allowed-endpoints: >-
             api.github.com:443
             github.com:443
+      - name: Wait until Harden-Runner lets the hosts through
+        # The runner may have asked for an address past Harden-Runner, which then blocks
+        # that address for as long as systemd-resolved keeps it, up to a minute.
+        timeout-minutes: 4
+        env:
+          HOSTS: >-
+            api.github.com:443
+            github.com:443
+        run: |
+          deadline=$(($(date +%s) + 120))
+          for endpoint in $HOSTS; do
+            host="${endpoint%:*}"
+            # A wildcard names no host to ask.
+            [[ "$host" == '*.'* ]] && continue
+            until curl --silent --head --connect-timeout 3 --max-time 5 --output /dev/null "https://$host/"; do
+              if (($(date +%s) >= deadline)); then
+                echo "::warning::Harden-Runner still blocks $host after two minutes; a step that needs it will fail, and the job can run again."
+                break
+              fi
+              echo "Harden-Runner still blocks $host, waiting 3 s."
+              sleep 3
+            done
+          done
       # The checkouts below take the issue assistant of the commit of this workflow,
       # which GitHub names in the context of the job. Without one, actions/checkout
       # would take the caller's own repository at its default branch, and the job
@@ -401,7 +484,7 @@ jobs:
           # docs and tests of the issue assistant would only mislead it there.
           sparse-checkout: |
             /action.yml
-            /issue_assistant.py
+            /issue_assistant/
             /version.txt
             /prompts/
             /locales/
@@ -418,3 +501,13 @@ jobs:
           engine: ${{ needs.analyze.outputs.engine }}
           answer: ${{ needs.analyze.outputs.answer }}
           dry-run: ${{ inputs.dry_run }}
+      - name: Wait until Harden-Runner has removed Docker
+        # Harden-Runner removes Docker with apt-get in the background; a job that ends
+        # before it finishes hangs in "Cleaning up orphan processes" until its timeout.
+        if: always()
+        run: |
+          for _ in {1..120}; do
+            pgrep -x 'apt-get|dpkg' >/dev/null || exit 0
+            sleep 1
+          done
+          echo "::warning::Harden-Runner still removes Docker after two minutes; the job may hang until its timeout."

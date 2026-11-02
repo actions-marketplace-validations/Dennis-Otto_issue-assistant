@@ -139,7 +139,7 @@ jobs:
             echo
             echo "This repository $missing, which $BOT needs to $TASK; $WITHOUT. The release app is a GitHub App of the owner, whose token may do what the token of a job can't: start the checks of a pull request, change a workflow and apply the settings."
             echo
-            echo "\`python3 .github/blueprint.py checklist\` shows the steps: a link that registers the app with its permissions filled in, the update of the answers of the blueprint that names it in \`.github/repository.toml\`, the settings and its private key. Once they are done, $BOT can $TASK in its next run."
+            echo "\`python3 .github/blueprint.py app register\` registers the app, sets its private key and opens the pull request that names it in \`.github/repository.toml\`; \`python3 .github/blueprint.py checklist\` shows what is left, such as its installation and the settings. Once they are done, $BOT can $TASK in its next run."
           } >> "$GITHUB_STEP_SUMMARY"
           if [[ "$REQUIRED" == true ]]; then
             exit 1
@@ -455,10 +455,7 @@ jobs:
       contents: write
       id-token: write
     uses: ./.github/workflows/build-release.yml
-    # A called workflow sees the secrets of its environment only when the caller
-    # passes its secrets on: the build signs a Nextcloud app with the key of the
-    # environment release.
-    secrets: inherit
+    # The build gets none of the secrets of the release, only the token of its job.
     with:
       tag: ${{ needs.release-please.outputs.tag }}
       sha: ${{ needs.release-please.outputs.sha }}
@@ -615,7 +612,7 @@ jobs:
           persist-credentials: false
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
