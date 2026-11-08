@@ -1440,10 +1440,14 @@ def test_the_canary_runs_every_week_and_after_every_change_of_its_path():
         assert next(ROOT.glob(pattern), None), f"{pattern} matches no file"
 
 
-def start_script():
+def start_step():
     return step_named(
         CANARY["jobs"]["start"], "Start the canary and wait for its result"
-    )["run"]
+    )
+
+
+def start_script():
+    return start_step()["run"]
 
 
 # The GitHub CLI of the job start, as a shell function: it notes its arguments and
@@ -1452,7 +1456,7 @@ FAKE_GH = """
 gh() {
   echo "gh $*" >> "$CALLS"
   case "$1 $2" in
-    "api --method") [[ -z "$RUN" ]] || echo "$RUN" ;;
+    "api --header") [[ -z "$RUN" ]] || echo "$RUN" ;;
     "run view") echo "$CONCLUSION" ;;
   esac
 }
@@ -1485,6 +1489,7 @@ def test_the_push_fails_when_the_canary_that_it_started_fails(
         "GH_REPO": "octo/assistant",
         "GITHUB_REF_NAME": "main",
         "GITHUB_SERVER_URL": "https://github.com",
+        "API_VERSION_HEADER": start_step()["env"]["API_VERSION_HEADER"],
     }
     result = subprocess.run(
         [shutil.which("bash"), "-e", "-c", FAKE_GH + start_script()],
@@ -1497,8 +1502,9 @@ def test_the_push_fails_when_the_canary_that_it_started_fails(
     assert says in result.stdout
     started, *rest = calls.read_text(encoding="utf-8").splitlines()
     assert started == (
-        "gh api --method POST repos/octo/assistant/actions/workflows/canary.yml/"
-        "dispatches -f ref=main -F return_run_details=true --jq .workflow_run_id"
+        f"gh api --header {assistant.API_VERSION_HEADER} --method POST "
+        "repos/octo/assistant/actions/workflows/canary.yml/dispatches -f ref=main "
+        "-F return_run_details=true --jq .workflow_run_id"
     )
     if run:
         url = "https://github.com/octo/assistant/actions/runs/42"
@@ -1538,17 +1544,17 @@ def test_the_github_cli_sends_no_telemetry():
 
 def screenshot_checkout(path, job_name, step):
     # The screenshot bot of the blueprint renders the newest commit of the branch that
-    # started it, which a workflow run starts on the default branch; its job with the
-    # token of the release app checks out the commit that it rendered only after a step
-    # has checked that main has it (decision 0118 of the blueprint).
+    # started it, which a workflow run starts on the default branch; its job start names
+    # that commit, and its job with the token of the release app checks it out only after
+    # a step has checked that main has it (decisions 0118 and 0120 of the blueprint).
     if path.name != "screenshot-bot.yml":
         return False
     if step["with"]["ref"] == "${{ github.ref }}":
         return True
     names = [other.get("name") for other in load(path)["jobs"][job_name]["steps"]]
-    check = "Check that main has the commit that the job render names"
+    check = "Check that main has the commit that the job start names"
     return (
-        step["with"]["ref"] == "${{ needs.render.outputs.sha }}"
+        step["with"]["ref"] == "${{ needs.start.outputs.sha }}"
         and check in names
         and names.index(check) < load(path)["jobs"][job_name]["steps"].index(step)
     )
