@@ -10,6 +10,16 @@ job of each call passed, with the step that writes the plan of its dry run, or w
 skipped where the call has to skip it. It shows each job in a table in the summary
 of the job and fails on every one that didn't run as it should.
 
+GitHub lists the steps of a job some time after the job ends, once minutes after
+(issue #288): while it lists a job that has to run as passed without the step that
+writes its plan, as not yet completed, or without any step though it ran, the script
+reads the jobs again, every PAUSE seconds for up to READS times, before it judges.
+It reads them again, too, after a read that may succeed when it comes again: one
+without an answer, such as on a failed connection, or with an error of GitHub's
+servers, a timeout or a rate limit. A read that GitHub refuses with any other error of
+the client, such as 403 or 404, fails the check at once (issue #327): every read
+again would repeat it.
+
 Before the calls, the job "what the reusable workflows run" runs
 `workflow_test.py changes`, which decides whether they run: on a pull request only
 when it changes a file that the dry runs run or read, so that the check, which main
@@ -28,7 +38,9 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
 
@@ -53,12 +65,14 @@ CALLS: dict[str, dict[str, str | None]] = {
     "reusable-issue-assistant.yml": {
         "Handle the event": "Take the issue of the smoke test",
         "Analyze with the AI engine": None,
+        "Analyze with the AI engine on the runner in reserve": None,
         "Check and post the analysis": "Check the engine's answer and post it",
     },
     # A pull request is no event of the discussions.
     "reusable-discussion-assistant.yml": {
         "Handle the event": None,
         "Analyze with the AI engine": None,
+        "Analyze with the AI engine on the runner in reserve": None,
         "Check and post the answer": None,
     },
 }
@@ -96,19 +110,61 @@ EXIT_CODE = re.compile(r"Process completed with exit code \d+\.")
 
 TITLE = "### The reusable workflows as dry runs"
 
+# How often the gate reads the jobs again, and how many seconds apart, while GitHub
+# lists a job without the steps that it ran: five minutes in all, which the
+# timeout of the job "reusable workflows" in workflow-test.yml leaves room for.
+READS = 15
+PAUSE = 20
+
 # The version of GitHub's REST API that every call asks for, that of the issue
 # assistant: the job's sparse checkout holds this script alone, so it keeps a copy of
 # API_VERSION_HEADER of issue_assistant/github.py, which tests/test_workflow_test.py
 # keeps equal.
 API_VERSION_HEADER = "X-GitHub-Api-Version: 2022-11-28"
 
+# How the GitHub CLI names the HTTP status of GitHub's answer to a call that failed,
+# such as "gh: Not Found (HTTP 404)", or "gh: HTTP 502" without a message of GitHub's;
+# it names none when no answer came, such as on a failed connection.
+STATUS = re.compile(r"\bHTTP (\d{3})\b")
+# The errors of the client that may pass: a request that timed out, and too many
+# requests. GitHub refuses a call over a rate limit with 403 or 429, and lifts it
+# later; it repeats every other error of the client, such as 401, 403 or 404.
+PASSING = frozenset({408, 429})
+RATE_LIMIT = re.compile(r"rate limit", re.IGNORECASE)
+# What to look at after GitHub refused a read with this status of the client.
+REFUSALS: dict[int | None, str] = {
+    401: "Is the token of the job still valid?",
+    403: "Does the job still have the permission `actions: read`?",
+    404: "Do `GH_REPO` and `RUN` name this run of this repository?",
+}
+
 Job = Mapping[str, Any]
 Annotation = Mapping[str, Any]
 
 
-def gh(*arguments: str) -> str | None:
-    """What the GitHub CLI printed; None when it failed, after a warning. Every call
-    is a call of `gh api` that asks for the version of the API."""
+@dataclass(frozen=True)
+class Failure:
+    """A call of the GitHub CLI that failed: the HTTP status of GitHub's answer, None
+    when no answer came, and what the CLI said."""
+
+    status: int | None
+    said: str
+
+    @property
+    def transient(self) -> bool:
+        """Whether the call may succeed when it comes again: without an answer, on an
+        error of GitHub's servers, a timeout or a rate limit."""
+        return (
+            self.status is None
+            or self.status >= 500
+            or self.status in PASSING
+            or RATE_LIMIT.search(self.said) is not None
+        )
+
+
+def gh(*arguments: str) -> str | Failure:
+    """What the GitHub CLI printed, or its failure, after a warning. Every call is a
+    call of `gh api` that asks for the version of the API."""
     result = subprocess.run(
         ["gh", "api", *arguments, "--header", API_VERSION_HEADER],
         capture_output=True,
@@ -117,8 +173,10 @@ def gh(*arguments: str) -> str | None:
         check=False,
     )
     if result.returncode != 0:
-        print(f"::warning::gh api {arguments[0]} failed: {result.stderr.strip()}")
-        return None
+        said = result.stderr.strip()
+        print(f"::warning::gh api {arguments[0]} failed: {said}")
+        statuses = STATUS.findall(said)
+        return Failure(int(statuses[-1]) if statuses else None, said)
     return result.stdout
 
 
@@ -163,7 +221,7 @@ def files_of(repository: str, number: str) -> list[str] | None:
         "--jq",
         ".[] | .filename, (.previous_filename // empty)",
     )
-    return None if printed is None else printed.splitlines()
+    return None if isinstance(printed, Failure) else printed.splitlines()
 
 
 def changes_command() -> int:
@@ -195,6 +253,77 @@ def tolerated(job: Job, annotations: Sequence[Annotation] | None) -> bool:
     )
 
 
+def listed(jobs: Sequence[Job], full: str) -> Job | None:
+    """The job of that name, call and job, as GitHub lists it; None if it doesn't."""
+    return next((job for job in jobs if job.get("name") == full), None)
+
+
+def unsettled(jobs: Sequence[Job]) -> list[str]:
+    """The jobs that have to run and that GitHub doesn't list as they ended yet: not
+    completed, or without the step that writes their plan though they passed, or
+    without any step though they ran, or completed with that step not yet completed.
+    Once completed, a job that passed lists every step as completed, and one that ran
+    at least the first; a job that ended earlier, such as one that failed before its
+    plan, is judged as it is."""
+    late = []
+    for call, called in CALLS.items():
+        for name, plan in called.items():
+            full = f"{call} / {name}"
+            job = listed(jobs, full)
+            if plan is None or job is None:
+                continue
+            listed_steps = job.get("steps") or []
+            steps = [str(step.get("name")) for step in listed_steps]
+            step = next((s for s in listed_steps if s.get("name") == plan), None)
+            if step is not None and (
+                step.get("status") == "completed" or job.get("status") != "completed"
+            ):
+                continue
+            conclusion = job.get("conclusion")
+            if (
+                job.get("status") != "completed"
+                or conclusion == "success"
+                or (not steps and conclusion != "skipped")
+            ):
+                late.append(full)
+    return late
+
+
+def settled(
+    read: Callable[[], list[Job] | Failure], sleep: Callable[[float], None]
+) -> tuple[list[Job] | Failure, list[str]]:
+    """The jobs of the run once GitHub lists each as it ended, read again every PAUSE
+    seconds for up to READS times, and those that it still lists too early then. A
+    read that may succeed when it comes again keeps the jobs that GitHub listed
+    before, or the failure when it never listed them; a read that GitHub refuses ends
+    the reads with its failure."""
+    jobs = read()
+    late = [] if isinstance(jobs, Failure) else unsettled(jobs)
+    reads = 0
+    while ((isinstance(jobs, Failure) and jobs.transient) or late) and reads < READS:
+        if isinstance(jobs, Failure):
+            print(
+                "GitHub didn't list the jobs of this run; reading them again in "
+                f"{PAUSE} s."
+            )
+        else:
+            print(
+                f"GitHub lists {len(late)} of the jobs without the steps that they ran "
+                f"yet, such as {late[0]}; reading the jobs again in {PAUSE} s."
+            )
+        sleep(PAUSE)
+        reads += 1
+        again = read()
+        if not isinstance(again, Failure):
+            jobs = again
+            late = unsettled(jobs)
+        elif not again.transient:
+            return again, []
+    if reads and not isinstance(jobs, Failure) and not late:
+        print(f"GitHub listed every job as it ended after {reads * PAUSE} s.")
+    return jobs, late
+
+
 def judge(
     call: str,
     job: Job | None,
@@ -218,6 +347,12 @@ def judge(
         return conclusion, "it was skipped, but the call has to run it"
     steps = {str(step.get("name")): step for step in job.get("steps") or []}
     step = steps.get(plan)
+    if step is None and not steps:
+        return (
+            conclusion,
+            f"GitHub lists none of its steps, so none shows the step “{plan}”, which "
+            "writes the plan of its dry run",
+        )
     if step is None:
         return (
             conclusion,
@@ -247,7 +382,7 @@ def check(
     for call, called in CALLS.items():
         for name, plan in called.items():
             full = f"{call} / {name}"
-            job = next((job for job in jobs if job.get("name") == full), None)
+            job = listed(jobs, full)
             result, problem = judge(call, job, plan, annotations)
             expected = f"passes, with “{plan}”" if plan else "skipped"
             rows.append(f"| {full} | {expected} | {result} |")
@@ -262,13 +397,13 @@ def check(
     return rows, problems
 
 
-def jobs_of(repository: str, run: str) -> list[Job] | None:
+def jobs_of(repository: str, run: str) -> list[Job] | Failure:
     """The latest jobs of the run, also of a run again of its failed jobs."""
     printed = gh(
         f"repos/{repository}/actions/runs/{run}/jobs?filter=latest&per_page=100"
     )
-    if printed is None:
-        return None
+    if isinstance(printed, Failure):
+        return printed
     jobs: list[Job] = json.loads(printed)["jobs"]
     return jobs
 
@@ -278,7 +413,7 @@ def annotations_of(repository: str) -> Callable[[Job], Sequence[Annotation] | No
         printed = gh(
             f"repos/{repository}/check-runs/{job['id']}/annotations?per_page=100"
         )
-        if printed is None:
+        if isinstance(printed, Failure):
             return None
         annotations: list[Annotation] = json.loads(printed)
         return annotations
@@ -303,10 +438,26 @@ def verify_command() -> int:
         write("GITHUB_STEP_SUMMARY", f"{TITLE}\n\n{line}\n")
         return 0
     repository = os.environ["GH_REPO"]
-    jobs = jobs_of(repository, os.environ["RUN"])
-    if jobs is None:
+    run = os.environ["RUN"]
+    jobs, late = settled(lambda: jobs_of(repository, run), time.sleep)
+    if isinstance(jobs, Failure) and jobs.transient:
         print("::error::GitHub didn't list the jobs of this run; run it again.")
         return 1
+    if isinstance(jobs, Failure):
+        said = (jobs.said.strip().splitlines() or ["no message"])[0]
+        hint = REFUSALS.get(jobs.status, "Is the request of the check still valid?")
+        print(
+            "::error::GitHub refused to list the jobs of this run with HTTP "
+            f"{jobs.status} ({said}), which every read again would repeat, so the "
+            f"check didn't wait. {hint}"
+        )
+        return 1
+    if late:
+        print(
+            f"::warning::GitHub still lists {len(late)} of the jobs without the steps "
+            f"that they ran, after {READS * PAUSE // 60} minutes. Where the check of "
+            "such a job shows the step that writes its plan, run this check again."
+        )
     rows, problems = check(jobs, annotations_of(repository))
     table = "| Job | Expected | Result |\n| --- | --- | --- |\n" + "\n".join(rows)
     for problem in problems:

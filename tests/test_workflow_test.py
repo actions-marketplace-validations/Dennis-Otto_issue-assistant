@@ -99,8 +99,8 @@ def test_the_script_knows_every_job_and_the_step_that_writes_its_plan():
             plan = expected[job["name"]]
             if plan is not None:
                 assert plan in [step.get("name") for step in job["steps"]], plan
-    # Of the issues, analyze alone is skipped: the smoke test runs no engine. A pull
-    # request is no event of the discussions.
+    # Of the issues, the two jobs of the AI alone are skipped: the smoke test runs no
+    # engine. A pull request is no event of the discussions.
     skipped = {
         f"{call} / {name}"
         for call, expected in script.CALLS.items()
@@ -109,8 +109,12 @@ def test_the_script_knows_every_job_and_the_step_that_writes_its_plan():
     }
     assert skipped == {
         "reusable-issue-assistant.yml / Analyze with the AI engine",
+        "reusable-issue-assistant.yml / Analyze with the AI engine on the runner in "
+        "reserve",
         "reusable-discussion-assistant.yml / Handle the event",
         "reusable-discussion-assistant.yml / Analyze with the AI engine",
+        "reusable-discussion-assistant.yml / Analyze with the AI engine on the runner "
+        "in reserve",
         "reusable-discussion-assistant.yml / Check and post the answer",
     }
 
@@ -131,8 +135,12 @@ def test_the_gate_waits_for_every_call_and_is_the_required_check():
     assert check["env"]["RUN"] == "${{ github.run_id }}"
     assert check["env"]["CHANGES"] == "${{ needs.changes.result }}"
     assert check["env"]["WANTED"] == "${{ needs.changes.outputs.run }}"
+    # Room for the wait for Harden-Runner, up to two minutes, for GitHub to list the
+    # steps of every job and for Harden-Runner to remove Docker, up to two minutes.
+    assert gate["timeout-minutes"] >= 2 + script.READS * script.PAUSE / 60 + 2 + 1
     explain = gate["steps"][-2]
-    assert explain["if"] == "failure()"
+    # Not after the step that stopped the job because Harden-Runner didn't block.
+    assert explain["if"] == "failure() && steps.blocks.outcome != 'failure'"
     assert explain["env"] == {"CHECK": gate["name"]}
     settings = tomllib.loads(
         (ROOT / ".github/repository.project.toml").read_text("utf-8")
@@ -310,8 +318,46 @@ def test_the_script_asks_for_the_version_of_the_api_that_the_assistant_asks_for(
 
 def test_gh_warns_when_the_github_cli_fails(monkeypatch, capsys):
     monkeypatch.setattr(subprocess, "run", completed(code=1, stderr="HTTP 403\n"))
-    assert script.gh("repos/o/r") is None
+    assert script.gh("repos/o/r") == script.Failure(403, "HTTP 403")
     assert capsys.readouterr().out == "::warning::gh api repos/o/r failed: HTTP 403\n"
+
+
+@pytest.mark.parametrize(
+    ("said", "status", "transient"),
+    [
+        # As the GitHub CLI says it: GitHub's message, then the status of its answer.
+        ("gh: Not Found (HTTP 404)", 404, False),
+        ("gh: Resource not accessible by integration (HTTP 403)", 403, False),
+        ("gh: Bad credentials (HTTP 401)", 401, False),
+        ("gh: Validation Failed (HTTP 422)", 422, False),
+        # An answer without a message of GitHub's.
+        ("gh: HTTP 502", 502, True),
+        ("gh: Service Unavailable (HTTP 503)", 503, True),
+        ("gh: HTTP 408", 408, True),
+        ("gh: HTTP 429", 429, True),
+        # GitHub refuses a call over a rate limit with 403 or 429, and lifts it later.
+        ("gh: API rate limit exceeded for installation ID 1. (HTTP 403)", 403, True),
+        ("gh: You have exceeded a secondary rate limit. (HTTP 429)", 429, True),
+        # No answer came.
+        (
+            "error connecting to api.github.com\n"
+            "check your internet connection or https://githubstatus.com",
+            None,
+            True,
+        ),
+        ("", None, True),
+    ],
+)
+def test_a_failure_names_the_status_of_github_s_answer(
+    monkeypatch, capsys, said, status, transient
+):
+    """Only a read that may succeed is worth a read again: GitHub repeats every
+    error of the client but a timeout and a rate limit on every read."""
+    monkeypatch.setattr(subprocess, "run", completed(code=1, stderr=f"{said}\n"))
+    failure = script.gh("repos/o/r")
+    assert failure == script.Failure(status, said)
+    assert failure.transient is transient
+    assert capsys.readouterr().out.startswith("::warning::gh api repos/o/r failed: ")
 
 
 @pytest.mark.parametrize(
@@ -549,6 +595,18 @@ def replaced(*jobs):
             "it ended as success, and its step “Create and update the labels” as "
             "skipped",
         ),
+        # The job failed before it reached its plan, such as in its first step.
+        (
+            replaced(
+                (
+                    f"{LABELS} / {LABELS_JOB}",
+                    job(LABELS, LABELS_JOB, "failure", [("Set up job", "failure")]),
+                )
+            ),
+            "failure",
+            "it has no step “Create and update the labels”, which writes the plan of "
+            "its dry run",
+        ),
         (
             replaced(
                 (
@@ -593,8 +651,8 @@ def test_a_job_without_a_conclusion_shows_its_status():
     jobs = replaced((name, {"name": name, "status": "in_progress"}))
     rows, problems = script.check(jobs, no_annotations)
     assert problems == [
-        f"{name}: it has no step “Create and update the labels”, which writes the "
-        "plan of its dry run."
+        f"{name}: GitHub lists none of its steps, so none shows the step “Create and "
+        "update the labels”, which writes the plan of its dry run."
     ]
     jobs = replaced(
         (name, {"name": name, "steps": [{"name": "Create and update the labels"}]})
@@ -670,18 +728,37 @@ def test_the_jobs_and_annotations_come_from_the_api(monkeypatch):
         ],
         ["gh", "api", "repos/o/r/check-runs/9/annotations?per_page=100", *VERSION],
     ]
-    monkeypatch.setattr(subprocess, "run", completed(code=1))
-    assert script.jobs_of("o/r", "7") is None
+    monkeypatch.setattr(subprocess, "run", completed(code=1, stderr="HTTP 404"))
+    assert script.jobs_of("o/r", "7") == script.Failure(404, "HTTP 404")
     assert script.annotations_of("o/r")({"id": 9}) is None
 
 
-def verify(monkeypatch, tmp_path, listed, **env):
+def listing(*reads):
+    """A GitHub CLI that lists these jobs, one list after the other, and fails for
+    None with an error of GitHub's servers, or for a text with that text as what it
+    says; the last one stays."""
+    left = list(reads)
+
+    def run(arguments, **options):
+        jobs = left.pop(0) if len(left) > 1 else left[0]
+        if jobs is None or isinstance(jobs, str):
+            return subprocess.CompletedProcess(arguments, 1, "", jobs or "HTTP 502")
+        return subprocess.CompletedProcess(arguments, 0, json.dumps({"jobs": jobs}), "")
+
+    return run
+
+
+SLEPT: list[float] = []
+
+
+def verify(monkeypatch, tmp_path, listed, *later, **env):
     """The exit code of the gate and its summary, with `listed` as the jobs that
-    GitHub lists, or a failure of the GitHub CLI for None."""
-    if listed is None:
-        monkeypatch.setattr(subprocess, "run", completed(code=1))
-    else:
-        monkeypatch.setattr(subprocess, "run", completed(json.dumps({"jobs": listed})))
+    GitHub lists, or a failure of the GitHub CLI as in `listing()` (for None an
+    error of GitHub's servers, for a text a failure that says that text), and
+    `later` as what it lists when the gate reads the jobs again. The gate doesn't really wait."""
+    monkeypatch.setattr(subprocess, "run", listing(listed, *later))
+    monkeypatch.setattr(script.time, "sleep", SLEPT.append)
+    SLEPT.clear()
     summary = tmp_path / "summary"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     monkeypatch.setenv("GH_REPO", "o/r")
@@ -733,6 +810,255 @@ def test_the_gate_names_every_job_that_did_not_run_as_it_has_to(
     )
 
 
+# The jobs that have to run, each with the step that writes its plan.
+RAN = sum(
+    plan is not None for called in script.CALLS.values() for plan in called.values()
+)
+
+
+def too_early(jobs):
+    """The jobs as GitHub listed them for minutes on 2026-11-08 (#288): each job that
+    ran, and passed, without any of its steps."""
+    return [
+        {**item, "steps": []} if item["conclusion"] == "success" else item
+        for item in jobs
+    ]
+
+
+def test_the_gate_waits_until_github_lists_the_steps_of_every_job(
+    monkeypatch, tmp_path, capsys
+):
+    """GitHub lists the steps of a job some time after it ends: the gate read the
+    jobs too early and failed on each job that had passed (#288)."""
+    good = jobs_as_they_should_be()
+    code, summary = verify(
+        monkeypatch,
+        tmp_path,
+        too_early(good),
+        too_early(good),
+        good,
+        CHANGES="success",
+        WANTED="true",
+    )
+    assert code == 0
+    assert SLEPT == [script.PAUSE, script.PAUSE]
+    early = (
+        f"GitHub lists {RAN} of the jobs without the steps that they ran yet, such "
+        f"as {LABELS} / {LABELS_JOB}; reading the jobs again in 20 s.\n"
+    )
+    assert capsys.readouterr().out == (
+        early * 2 + "GitHub listed every job as it ended after 40 s.\n"
+        "Each reusable workflow ran as a dry run, as its call has to.\n"
+    )
+    assert "| passes, with “Create and update the labels” | passed |" in summary
+
+
+def test_the_gate_fails_when_github_lists_a_job_too_early_for_too_long(
+    monkeypatch, tmp_path, capsys
+):
+    code, summary = verify(
+        monkeypatch,
+        tmp_path,
+        too_early(jobs_as_they_should_be()),
+        CHANGES="success",
+        WANTED="true",
+    )
+    assert code == 1
+    assert SLEPT == [script.PAUSE] * script.READS
+    out = capsys.readouterr().out.splitlines()
+    assert out[script.READS] == (
+        f"::warning::GitHub still lists {RAN} of the jobs without the steps that "
+        "they "
+        "ran, after 5 minutes. Where the check of such a job shows the step that "
+        "writes its plan, run this check again."
+    )
+    assert out[script.READS + 1] == (
+        f"::error::{LABELS} / {LABELS_JOB}: GitHub lists none of its steps, so none "
+        "shows the step “Create and update the labels”, which writes the plan of "
+        "its dry run."
+    )
+    assert summary.endswith(f"\n\n{RAN} of the jobs didn't run as their call has to.\n")
+
+
+def test_the_gate_reads_the_jobs_again_when_github_fails_to_list_them(
+    monkeypatch, tmp_path, capsys
+):
+    """A failed read keeps what GitHub listed before, if anything."""
+    good = jobs_as_they_should_be()
+    code, _ = verify(
+        monkeypatch,
+        tmp_path,
+        None,
+        too_early(good),
+        None,
+        good,
+        CHANGES="success",
+        WANTED="true",
+    )
+    assert code == 0
+    assert SLEPT == [script.PAUSE] * 3
+    out = capsys.readouterr().out
+    assert out.startswith(
+        "::warning::gh api repos/o/r/actions/runs/7/jobs?filter=latest&per_page=100 "
+        "failed: HTTP 502\n"
+        "GitHub didn't list the jobs of this run; reading them again in 20 s.\n"
+        f"GitHub lists {RAN} of the jobs without"
+    )
+    assert out.count(f"GitHub lists {RAN} of the jobs without") == 2
+    assert "GitHub listed every job as it ended after 60 s.\n" in out
+
+
+REFUSED = "gh: Resource not accessible by integration (HTTP 403)"
+
+
+def refusal(status, said, hint):
+    return (
+        f"::error::GitHub refused to list the jobs of this run with HTTP {status} "
+        f"({said}), which every read again would repeat, so the check didn't wait. "
+        f"{hint}\n"
+    )
+
+
+def test_the_gate_fails_at_once_when_github_refuses_to_list_the_jobs(
+    monkeypatch, tmp_path, capsys
+):
+    """A read again only repeats an error of the client: the gate read the jobs
+    for five minutes before it failed, and then asked for a run again (#327)."""
+    code, summary = verify(
+        monkeypatch, tmp_path, REFUSED, CHANGES="success", WANTED="true"
+    )
+    assert code == 1
+    assert SLEPT == []
+    assert capsys.readouterr().out == (
+        "::warning::gh api repos/o/r/actions/runs/7/jobs?filter=latest&per_page=100 "
+        f"failed: {REFUSED}\n"
+        + refusal(
+            403, REFUSED, "Does the job still have the permission `actions: read`?"
+        )
+    )
+    assert summary == ""
+
+
+def test_the_gate_stops_reading_when_github_refuses_a_read_again(
+    monkeypatch, tmp_path, capsys
+):
+    good = jobs_as_they_should_be()
+    code, _ = verify(
+        monkeypatch,
+        tmp_path,
+        too_early(good),
+        "gh: Not Found (HTTP 404)",
+        good,
+        CHANGES="success",
+        WANTED="true",
+    )
+    assert code == 1
+    assert SLEPT == [script.PAUSE]
+    assert capsys.readouterr().out.endswith(
+        refusal(
+            404,
+            "gh: Not Found (HTTP 404)",
+            "Do `GH_REPO` and `RUN` name this run of this repository?",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("said", "named", "hint"),
+    [
+        (
+            "gh: Bad credentials (HTTP 401)",
+            "gh: Bad credentials (HTTP 401)",
+            "Is the token of the job still valid?",
+        ),
+        (
+            "gh: Validation Failed (HTTP 422)\n{}",
+            "gh: Validation Failed (HTTP 422)",
+            "Is the request of the check still valid?",
+        ),
+    ],
+)
+def test_a_refusal_names_githubs_message_and_where_to_look(
+    monkeypatch, tmp_path, capsys, said, named, hint
+):
+    """A refusal other than 403 has nothing to do with `actions: read`."""
+    code, _ = verify(monkeypatch, tmp_path, said, CHANGES="success", WANTED="true")
+    assert code == 1
+    status = int(named[-4:-1])
+    assert capsys.readouterr().out.endswith(refusal(status, named, hint))
+
+
+def test_the_gate_reads_the_jobs_again_after_a_rate_limit(
+    monkeypatch, tmp_path, capsys
+):
+    """GitHub lifts a rate limit later, though it answers it with 403."""
+    good = jobs_as_they_should_be()
+    code, _ = verify(
+        monkeypatch,
+        tmp_path,
+        "gh: API rate limit exceeded for installation ID 1. (HTTP 403)",
+        good,
+        CHANGES="success",
+        WANTED="true",
+    )
+    assert code == 0
+    assert SLEPT == [script.PAUSE]
+    assert "GitHub didn't list the jobs of this run; reading them again in 20 s.\n" in (
+        capsys.readouterr().out
+    )
+
+
+STEPS_RAN = [("Set up job", "success"), ("Create and update the labels", "success")]
+
+
+@pytest.mark.parametrize(
+    ("listed", "late"),
+    [
+        # Too early: passed without its plan, not completed, or ran without a step.
+        (job(LABELS, LABELS_JOB, "success"), True),
+        (job(LABELS, LABELS_JOB, "success", [("Set up job", "success")]), True),
+        ({**job(LABELS, LABELS_JOB, None), "status": "in_progress"}, True),
+        (job(LABELS, LABELS_JOB, "failure"), True),
+        (job(LABELS, LABELS_JOB, "cancelled"), True),
+        (
+            {
+                **job(LABELS, LABELS_JOB, "success"),
+                "steps": [
+                    {
+                        "name": "Set up job",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "Create and update the labels",
+                        "status": "in_progress",
+                        "conclusion": None,
+                    },
+                ],
+            },
+            True,
+        ),
+        # As it ended: with its plan, failed before its plan, skipped, or not listed.
+        (job(LABELS, LABELS_JOB, "success", STEPS_RAN), False),
+        (job(LABELS, LABELS_JOB, "failure", STEPS_RAN), False),
+        (job(LABELS, LABELS_JOB, "failure", [("Set up job", "failure")]), False),
+        (job(LABELS, LABELS_JOB, "skipped"), False),
+        (None, False),
+    ],
+)
+def test_a_job_that_has_to_run_waits_while_github_lists_it_too_early(listed, late):
+    name = f"{LABELS} / {LABELS_JOB}"
+    assert script.unsettled(replaced((name, listed))) == ([name] if late else [])
+
+
+def test_a_job_that_its_call_skips_never_waits():
+    """Its steps say nothing: whatever it did, its conclusion is the verdict."""
+    name = "reusable-issue-assistant.yml / Analyze with the AI engine"
+    ran = job("reusable-issue-assistant.yml", "Analyze with the AI engine", "success")
+    assert script.unsettled(replaced((name, ran))) == []
+    assert script.unsettled(jobs_as_they_should_be()) == []
+
+
 def test_the_gate_passes_when_nothing_had_to_run(monkeypatch, tmp_path, capsys):
     code, summary = verify(
         monkeypatch, tmp_path, None, CHANGES="success", WANTED="false"
@@ -764,7 +1090,10 @@ def test_the_gate_fails_when_nothing_says_whether_the_calls_had_to_run(
 def test_the_gate_fails_when_github_lists_no_jobs(monkeypatch, tmp_path, capsys):
     code, _ = verify(monkeypatch, tmp_path, None, CHANGES="success", WANTED="true")
     assert code == 1
-    assert capsys.readouterr().out.endswith(
+    assert SLEPT == [script.PAUSE] * script.READS
+    out = capsys.readouterr().out
+    assert out.count("reading them again in 20 s.") == script.READS
+    assert out.endswith(
         "::error::GitHub didn't list the jobs of this run; run it again.\n"
     )
 

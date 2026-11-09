@@ -65,7 +65,7 @@ A GitHub Action that looks after the issues of a repository. Each line leads to 
 - **[Good first issue candidates](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/good-first-issues.md):** the digest names the issues that someone new could take; only a maintainer adds the label.
 - <a name="when-github-fails"></a>**[When GitHub fails](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/github-failures.md):** a rate limit, a server error or an incident never changes what the assistant posts.
 - **[Labels as code](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/configuration.md#githublabelstoml):** the labels of the repository in `.github/labels.toml`, from the issue forms and from the analysis, each with its reason.
-- **[Findings of code scanning](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/configuration.md#findings):** the findings that `.github/findings.toml` accepts are dismissed with their reason; any other open finding fails one run, the first after it opens, so GitHub mails about it once, without a public issue.
+- **[Findings of code scanning](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/configuration.md#findings):** the findings that `.github/findings.toml` accepts are dismissed with their reason, also in a pull request, where their review threads would block the merge; any other open finding fails one run, the first after it opens, so GitHub mails about it once, without a public issue.
 
 The maintainer reads every issue and has the last word. A first analysis looks like this, here on an issue of a demo project:
 
@@ -150,11 +150,11 @@ The workflows that `install` writes choose their own runners: `ubuntu-24.04`, an
 | `ubuntu-26.04` | 3.14 | What `ubuntu-latest` means since 2026-10-19 |
 | `ubuntu-24.04-arm` | 3.12 | ARM, free in public repositories |
 
-The action needs Python 3.12 or newer as `python3`, with `gh` and `git`; `check` also reads YAML with PyYAML or `yq`. On an older Python, such as on `ubuntu-22.04`, on a self-hosted runner or after `actions/setup-python` with an older version, the action stops in its first step with an error that names the version it found and the fix: run the job on `ubuntu-24.04`, or add `actions/setup-python` with `python-version: 3.12` before the action.
+The action needs Python 3.12 or newer as `python3`, with `gh` and `git`; `check` and `evaluate` also read YAML with PyYAML or `yq`. On an older Python, such as on `ubuntu-22.04`, on a self-hosted runner or after `actions/setup-python` with an older version, the action stops in its first step with an error that names the version it found and the fix: run the job on `ubuntu-24.04`, or add `actions/setup-python` with `python-version: 3.12` before the action.
 
 ## Development
 
-See [CONTRIBUTING.md](https://github.com/Dennis-Otto/issue-assistant/blob/main/CONTRIBUTING.md). The script needs only Python 3.12's standard library, `gh` and `git`, which GitHub's runners have; `check` reads YAML with PyYAML or `yq`. The tests check every GraphQL request against GitHub's schema, [dry runs](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/architecture/dry-runs.md) run the path of an issue through the AI and each reusable workflow as a repository calls them, and a change of [a template](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/architecture/templates.md) reaches the repositories with a release.
+See [CONTRIBUTING.md](https://github.com/Dennis-Otto/issue-assistant/blob/main/CONTRIBUTING.md). The script needs only Python 3.12's standard library, `gh` and `git`, which GitHub's runners have; `check` and `evaluate` read YAML with PyYAML or `yq`. The tests check every GraphQL request against GitHub's schema, [dry runs](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/architecture/dry-runs.md) run the path of an issue through the AI and each reusable workflow as a repository calls them, and a change of [a template](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/architecture/templates.md) reaches the repositories with a release.
 
 ## License
 
