@@ -73,7 +73,9 @@ jobs:
       # a pull request that makes a workflow run one that the list lacks, such as an
       # update of an action by Renovate, fails here and not every workflow after the
       # merge. It reads the files of the public actions with the token of the job, a
-      # few queries of GraphQL, and none of the settings on GitHub.
+      # few queries of GraphQL, and none of the settings on GitHub. It also fails for a
+      # workflow on pull_request_target that pull_request_target of [actions] lacks,
+      # which GitHub blocks in a public repository from 2 December 2026 (decision 0138).
       - name: Check that the allowed actions let every action start
         id: allowed-actions
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
@@ -110,7 +112,7 @@ jobs:
       - name: Check the issue assistant's set-up
         id: issue-assistant
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
-        uses: Dennis-Otto/issue-assistant@ed74e12357c89d40370f6422dedb34369db4f70b # v1.10.4
+        uses: Dennis-Otto/issue-assistant@0123f3b13f16bc5b0b732cd86901ba76a2f7b8cc # v1.10.5
         with:
           command: check
       - name: Check the sign-off of every commit

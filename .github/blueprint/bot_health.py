@@ -8,13 +8,19 @@ watched workflow ends on the default branch, the bot runs its failed jobs once m
 if a second try can pass, and otherwise keeps one issue per workflow current, with
 the failed jobs, their steps and their first errors; a run that passes closes it
 once every job that failed ran again in it and passed, so a run that skipped such a
-job, as one that only plans, leaves it open.
+job, as one that only plans, leaves it open. A bot of events, such as Welcome, also
+for a pull request, and a workflow that keeps an issue of its own get neither a second
+try nor an issue, unless Harden-Runner stopped a job of their first attempt: then
+their failed jobs run once more (decision 0141).
 Once a day it looks at the latest run of every workflow, those of the project too,
 in case GitHub lost an event, and starts a workflow whose schedule GitHub missed or
 switched off. A failure of Lint, which main runs only each week, counts only at the
-head of main: a pull request reaches main only when it passes Lint. The same look
+head of main: a pull request reaches main only when it passes Lint. A run that GitHub
+couldn't start, as in its outage of 9 November 2026, is no failure of the bot: its end
+starts nothing, and the daily look runs it again once (decision 0136). The same look
 keeps one issue open while the social preview that GitHub shows is not the committed
-.github/social-preview.png, which only a person can upload. In the blueprint, it also
+.github/social-preview.png, which only a person can upload; its label is manual-step,
+not bot-failure, since nothing fails there. In the blueprint, it also
 keeps one issue with the warnings and errors in the log of Renovate.
 """
 
@@ -31,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from blueprint.github import Api, GitHubError, Json
+from blueprint.outage import couldnt_start, never_started, unreachable
 from blueprint.social_preview import (
     PICTURE,
     PRIVATE,
@@ -47,6 +54,20 @@ LABEL_DESCRIPTION = (
     "A bot or a scheduled workflow fails on the default branch; "
     "closes when it passes again"
 )
+# The label of the issue that waits for a step that only a person can take, such as
+# the upload of the social preview, which no API offers: nothing fails there
+# (decision 0140).
+STEP = "manual-step"
+STEP_COLOR = "1d76db"
+STEP_DESCRIPTION = (
+    "A bot waits for a step that only a person can take, such as an upload; "
+    "closes once it is done"
+)
+# The color and description of the labels of the bot, by name.
+LABELS = {
+    LABEL: (LABEL_COLOR, LABEL_DESCRIPTION),
+    STEP: (STEP_COLOR, STEP_DESCRIPTION),
+}
 # The type of these issues, which every repository has among its labels.
 TYPE = "maintenance"
 PULL_REQUESTS = frozenset({"pull_request", "pull_request_target"})
@@ -55,15 +76,25 @@ PULL_REQUESTS = frozenset({"pull_request", "pull_request_target"})
 VERIFICATION = "Release verification"
 FAILED = frozenset({"failure", "timed_out", "startup_failure"})
 OUT_OF_TIME = "The job has exceeded the maximum execution time"
+# The annotation with which the step "Make sure that Harden-Runner blocks" stops a job
+# whose Harden-Runner doesn't block, mostly in an outage of GitHub (decision 0134).
+STOPPED = "would reach every host, and it stops here instead"
 PASSED = "success"
 # A second try only hides or repeats their failure: Findings fails while an alert is
 # open, Mutation takes hours to measure the same again, and the property tests and the
-# fuzzing failed on an input that they found.
+# fuzzing failed on an input that they found. Not so when Harden-Runner stopped every
+# job that failed: then the second try repeats nothing.
 ONE_TRY = frozenset({"Findings", "Mutation", "Property tests", "Fuzzing"})
 # Workflows that keep an issue of their own about their failures; a workflow of the
 # project says so in a comment line of its own, `# bot-health: own-issue`. The daily
 # look still starts one whose schedule GitHub missed or switched off.
 OWN_ISSUE = frozenset({"Diagrams", "Newest Node", "Newest Python", "Next runner"})
+# The bots of events: a pull request or a comment on one starts them, also one of a
+# fork, and a failure shows on that pull request. Like the workflows that keep an issue
+# of their own, they get no issue of the bot, and they run again only when
+# Harden-Runner stopped them, which no later event of theirs makes up for (decision
+# 0141).
+EVENT_BOTS = frozenset({"Area labels", "Commands", "Dependabot maintenance", "Welcome"})
 OWN_ISSUE_LINE = re.compile(r"^[ \t]*#[ \t]*bot-health:[ \t]*own-issue\b", re.MULTILINE)
 # The runs that do what a schedule does. A push may start the same workflow, but its
 # run may leave out what only the schedule does, such as the tests of the coming
@@ -81,8 +112,9 @@ SECOND_TRY_TIME = timedelta(hours=1)
 # GitHub starts a scheduled run hours late at times; a time of a schedule counts as
 # missed only when this much time has passed since.
 LATE = timedelta(hours=6)
-# The daily look starts at most this many workflows whose schedule GitHub missed, so
-# that it doesn't take the runners of the account from the pull requests.
+# The daily look starts at most this many workflows whose schedule GitHub missed, or
+# whose latest run GitHub couldn't start, so that it doesn't take the runners of the
+# account from the pull requests.
 MOST_STARTS = 4
 # How many earlier runs that passed the daily look reads when the latest passed
 # without a job that failed, so that its requests stay few.
@@ -239,13 +271,25 @@ class Issue:
     state: dict[str, Any]
 
 
-def open_issues(api: Api, repo: str) -> dict[str, Issue]:
-    """The open issues of the bot by the key in their state: the path of a workflow,
-    with the tag of a published release for its verification, or renovate. Where a key has several, because two runs of the bot opened one each
-    at the same moment, the newest one stays and the older ones close."""
+def open_issues(
+    api: Api, repo: str, labels: Iterable[str] = (LABEL,)
+) -> dict[str, Issue]:
+    """The open issues of the bot with one of the labels, by the key in their state:
+    the path of a workflow, with the tag of a published release for its
+    verification, renovate or social-preview. Where a key has several, because two
+    runs of the bot opened one each at the same moment, the newest one stays and the
+    older ones close."""
     found: dict[str, Issue] = {}
-    listed = api.get(f"repos/{repo}/issues?labels={LABEL}&state=open&per_page=100")
-    for item in listed or []:
+    listed = {
+        int(item["number"]): item
+        for label in labels
+        for item in api.get(
+            f"repos/{repo}/issues?labels={label}&state=open&per_page=100"
+        )
+        or []
+    }
+    # The newest first, also across the labels; an issue with both counts once.
+    for number, item in sorted(listed.items(), reverse=True):
         body = str(item.get("body") or "")
         match = MARKER.search(body)
         if "pull_request" in item or not match:
@@ -257,7 +301,6 @@ def open_issues(api: Api, repo: str) -> dict[str, Issue]:
         key = state.get("key")
         if not isinstance(key, str):
             continue
-        number = int(item["number"])
         if key in found:
             close_issue(
                 api,
@@ -272,14 +315,22 @@ def open_issues(api: Api, repo: str) -> dict[str, Issue]:
 
 
 def open_issue(
-    api: Api, repo: str, title: str, body: str, labels: Iterable[str]
+    api: Api,
+    repo: str,
+    title: str,
+    body: str,
+    labels: Iterable[str],
+    label: str = LABEL,
 ) -> int:
+    """Opens an issue of the bot with its label, bot-failure or manual-step, and
+    the other labels."""
     # The label of a repository whose .github/labels.toml, its own, lacks it.
-    if not api.exists(f"repos/{repo}/labels/{LABEL}"):
+    if not api.exists(f"repos/{repo}/labels/{label}"):
+        color, description = LABELS[label]
         try:
             api.post(
                 f"repos/{repo}/labels",
-                {"name": LABEL, "color": LABEL_COLOR, "description": LABEL_DESCRIPTION},
+                {"name": label, "color": color, "description": description},
             )
         except GitHubError as error:
             # The run for another workflow created it a moment ago.
@@ -288,7 +339,7 @@ def open_issue(
     response = api.request(
         "POST",
         f"repos/{repo}/issues",
-        {"title": title, "body": body, "labels": [LABEL, *labels]},
+        {"title": title, "body": body, "labels": [label, *labels]},
     )
     return int(response.data["number"])
 
@@ -485,6 +536,47 @@ def ran_out_of_time(api: Api, repo: str, run: Run) -> bool:
     )
 
 
+def stopped_by_harden_runner(
+    api: Api, repo: str, run: Run, *, every: bool = False
+) -> bool:
+    """Whether the step that makes sure that Harden-Runner blocks stopped a job of the
+    run that failed, as its annotation says, or with every, each job that failed, of
+    which a job that ran out of its time is one that Harden-Runner didn't stop."""
+    stopped = []
+    for job in jobs_of(api, repo, run.id, run.attempt):
+        conclusion = job.get("conclusion")
+        if conclusion not in ("failure", "timed_out", "cancelled"):
+            continue
+        messages = [
+            str(annotation.get("message"))
+            for annotation in annotations_of(api, repo, int(job["id"]))
+        ]
+        if conclusion == "cancelled":
+            # A job that GitHub cancelled at its time limit failed, one that a person,
+            # a newer run or a failed leg of its matrix cancelled didn't.
+            if every and any(OUT_OF_TIME in message for message in messages):
+                stopped.append(False)
+            continue
+        stopped.append(
+            conclusion == "failure" and any(STOPPED in message for message in messages)
+        )
+    return any(stopped) and (all(stopped) or not every)
+
+
+def second_try_can_pass(api: Api, repo: str, run: Run) -> bool:
+    """Whether a second try of the failed jobs can pass: at the first attempt of a run
+    that started, and for a workflow of one try only when Harden-Runner stopped each
+    job that failed, as the second try then repeats nothing of the failure."""
+    if run.deserves_second_try():
+        return True
+    return (
+        run.attempt == 1
+        and run.conclusion == "failure"
+        and run.name in ONE_TRY
+        and stopped_by_harden_runner(api, repo, run, every=True)
+    )
+
+
 def base_name(job: str) -> str:
     """The name of a job without the values of its matrix, such as render for
     render (en, 3/4), which another run may give other values or other legs."""
@@ -536,8 +628,9 @@ def not_passed_again(api: Api, repo: str, run: Run, issue: Issue) -> list[str]:
     return sorted(missing)
 
 
-def run_again(api: Api, repo: str, run: Run) -> str | None:
-    """Runs the failed jobs once more; None when GitHub refuses and no one else did."""
+def run_again(api: Api, repo: str, run: Run) -> bool | None:
+    """Runs the failed jobs once more: True when it did, False when another bot was
+    quicker, and None when GitHub refused and no one else did."""
     try:
         api.post(f"repos/{repo}/actions/runs/{run.id}/rerun-failed-jobs", {})
     except GitHubError:
@@ -545,9 +638,9 @@ def run_again(api: Api, repo: str, run: Run) -> str | None:
         latest = api.get(f"repos/{repo}/actions/runs/{run.id}") or {}
         newer = int(latest.get("run_attempt") or 1) > run.attempt
         if newer or latest.get("status") != "completed":
-            return "failed: another bot runs it again"
+            return False
         return None
-    return "failed: runs the failed jobs once more"
+    return True
 
 
 def look_at(
@@ -593,19 +686,26 @@ def look_at(
     if run.conclusion not in FAILED:
         return f"ended as {run.conclusion or run.status}: no failure"
     note = ""
-    if run.deserves_second_try():
+    if second_try_can_pass(api, repo, run):
         if second_try:
             tried = run_again(api, repo, run)
             if tried is not None:
-                return tried
+                return (
+                    "failed: runs the failed jobs once more"
+                    if tried
+                    else "failed: another bot runs it again"
+                )
             note = " (GitHub refused to run it again)"
         elif now - run.updated < SECOND_TRY_TIME:
             return "failed: its second try may still come"
     return report(api, repo, branch, run, issue) + note
 
 
-def watch_run(api: Api, repo: str, run_id: int, now: datetime) -> str:
-    """The end of a run of a watched workflow, as the event of GitHub reports it."""
+def watch_run(
+    api: Api, repo: str, run_id: int, now: datetime, notices: list[str] | None = None
+) -> str:
+    """The end of a run of a watched workflow, as the event of GitHub reports it; a
+    run that GitHub couldn't start adds a notice to notices."""
     data = api.get(f"repos/{repo}/actions/runs/{run_id}")
     if data is None:
         return f"GitHub doesn't know the run {run_id}."
@@ -616,9 +716,59 @@ def watch_run(api: Api, repo: str, run_id: int, now: datetime) -> str:
         return f"{run.name}: not a run of `{branch}`, nothing to do."
     if run.status != "completed":
         return f"{run.name}: runs again, its next end counts."
+    # The daily look watches the runs of the branch alone: the verification of a
+    # published release that GitHub couldn't start gets its second try or its report
+    # here, as any other failure.
+    if (
+        not published
+        and run.conclusion == "failure"
+        and never_started(api, repo, run.id, run.attempt)
+    ):
+        # Another try while GitHub fails would only fail again, and mail again.
+        if notices is not None:
+            notices.append(couldnt_start(f"the run {run.id} of {run.name}"))
+        later = (
+            "the daily look runs it again"
+            if run.attempt == 1
+            else "the daily look reports it if its last attempt never started either"
+        )
+        return (
+            f"{run.name}: GitHub couldn't start {run.link()}, so there is nothing to "
+            f"report; {later}."
+        )
     issues = open_issues(api, repo)
     ref = run.branch if published else branch
     return f"{run.name}: {look_at(api, repo, ref, run, issues, now, second_try=True)}."
+
+
+def watch_stop(api: Api, repo: str, run_id: int) -> tuple[str, bool]:
+    """The end of a run of a bot of events or of a workflow that keeps an issue of its
+    own, as the event of GitHub reports it, also one of a pull request or of a fork:
+    its failed jobs run once more when Harden-Runner stopped one of them at the first
+    attempt, and any other end stays theirs. False when GitHub refused that try."""
+    data = api.get(f"repos/{repo}/actions/runs/{run_id}")
+    if data is None:
+        return f"GitHub doesn't know the run {run_id}.", True
+    run = Run.of(data)
+    if run.status != "completed" or run.attempt > 1:
+        return f"{run.name}: runs again already, nothing to do.", True
+    if run.conclusion != "failure":
+        return f"{run.name}: ended as {run.conclusion}, nothing to do.", True
+    if not stopped_by_harden_runner(api, repo, run):
+        return (
+            f"{run.name}: Harden-Runner stopped no job of {run.link()}, which stays "
+            "failed.",
+            True,
+        )
+    tried = run_again(api, repo, run)
+    if tried is None:
+        return (
+            f"{run.name}: Harden-Runner stopped a job of {run.link()}, and GitHub "
+            "refused to run it again.",
+            False,
+        )
+    again = "its failed jobs run once more" if tried else "another bot runs it again"
+    return f"{run.name}: Harden-Runner stopped a job of {run.link()}, so {again}.", True
 
 
 # ---------------------------------------------------------------- the daily look
@@ -930,6 +1080,20 @@ def passed_before(
     return note
 
 
+def catch_up(api: Api, repo: str, run: Run, *, start: bool) -> tuple[str, bool]:
+    """What the daily look does for the latest run of a workflow, which GitHub
+    couldn't start at its first attempt, and whether it started it again: as a whole,
+    as GitHub ran none of it, or only jobs that passed."""
+    if not start:
+        return (
+            f"GitHub couldn't start {run.link()}: runs it again in a later look, "
+            f"{MOST_STARTS} a day",
+            False,
+        )
+    api.post(f"repos/{repo}/actions/runs/{run.id}/rerun", {})
+    return f"GitHub couldn't start {run.link()}: runs it again", True
+
+
 def look_after(
     api: Api,
     repo: str,
@@ -946,7 +1110,9 @@ def look_after(
     """What the daily look does for one workflow, and whether it started it. With
     after_checks, a run that the end of another workflow started doesn't count. With
     own, the workflow keeps an issue of its own: its runs open and close none here,
-    and only an issue of the bot from before it said so closes."""
+    and only an issue of the bot from before it said so closes. A latest run that
+    GitHub couldn't start runs again once; when GitHub couldn't start that try
+    either, the run is reported like any failure."""
     listed = runs_of(api, repo, branch, workflow, most=PAGE)
     runs = [run for run in listed if run.of_branch(repo, branch)]
     finished = next(
@@ -961,10 +1127,18 @@ def look_after(
     )
     notes = []
     waits = False
+    started = False
     if own:
         notes.append(leave_to_its_own(api, repo, workflow, issues))
     elif finished is None:
         notes.append(f"no finished run on `{branch}`")
+    elif (
+        finished.conclusion == "failure"
+        and finished.attempt == 1
+        and never_started(api, repo, finished.id, finished.attempt)
+    ):
+        note, started = catch_up(api, repo, finished, start=start)
+        notes.append(note)
     elif left_behind(api, repo, branch, finished):
         notes.append(f"failed at {finished.sha[:7]}, which `{branch}` has left")
         # Only a run of the branch closes its issue, and without an issue the next
@@ -995,9 +1169,11 @@ def look_after(
     due, readable = missed_time(text, now)
     if not readable:
         notes.append("a schedule that can't be read")
-    started = False
     reason = f"its issue waits for a run of the head of `{branch}`" if waits else ""
-    if due is not None and not ran_as_scheduled(
+    if started:
+        # The run that starts again is the one of its schedule.
+        reason = ""
+    elif due is not None and not ran_as_scheduled(
         api, repo, branch, workflow, listed, due
     ):
         reason = f"missed its run of {moment(due)}"
@@ -1023,11 +1199,16 @@ def sweep(
     root: Path,
     now: datetime,
     opener: Callable[..., Any] | None = None,
+    notices: list[str] | None = None,
 ) -> tuple[str, bool]:
     """The daily look at every workflow of the repository and at its social preview; a
-    summary in Markdown, and whether every look succeeded."""
+    summary in Markdown, and whether every look succeeded. A look that GitHub kept
+    failing, as in an outage, is no failure of the bot: the next day's look catches
+    up, and notices gets one notice about it."""
     branch = default_branch(api, repo)
-    issues = open_issues(api, repo)
+    # The issue of the social preview has the label manual-step, or bot-failure
+    # where an earlier release opened it.
+    issues = open_issues(api, repo, (LABEL, STEP))
     listed = api.get(f"repos/{repo}/actions/workflows?per_page=100")
     workflows = sorted(
         (listed or {}).get("workflows", []), key=lambda item: str(item["name"]).lower()
@@ -1075,13 +1256,23 @@ def sweep(
                 own=name in OWN_ISSUE or own_issue(text),
             )
         except GitHubError as error:
-            state, started, healthy = f"couldn't look: {code(str(error))}", False, False
+            state, started = f"couldn't look: {code(str(error))}", False
+            if not error.unavailable:
+                healthy = False
+            elif notices is not None and not notices:
+                notices.append(unreachable(error))
         starts += started
         lines.append(f"| {code(name)} | {state} |")
     try:
         uploaded = preview_report(api, repo, root, branch, issues.get(PREVIEW), opener)
     except (GitHubError, Unreadable) as error:
-        uploaded, healthy = f"Couldn't compare it: {code(str(error))}", False
+        uploaded = f"Couldn't compare it: {code(str(error))}"
+        if isinstance(error, GitHubError) and error.unavailable:
+            # As for the workflows: the next look compares it (decision 0136).
+            if notices is not None and not notices:
+                notices.append(unreachable(error))
+        else:
+            healthy = False
     if uploaded:
         lines += ["", "#### Social preview", "", uploaded]
     return "\n".join(lines) + "\n", healthy
@@ -1180,7 +1371,7 @@ def preview_report(
         f"{preview_body(repo, branch, commit, found.uploaded, found.fits)}"
     )
     if issue is None:
-        number = open_issue(api, repo, PREVIEW_TITLE, body, [TYPE])
+        number = open_issue(api, repo, PREVIEW_TITLE, body, [TYPE], STEP)
         return f"GitHub shows another picture than `{PICTURE}`: opened #{number}."
     api.patch(f"repos/{repo}/issues/{issue.number}", {"body": body})
     return f"`{PICTURE}` changed again: updated #{issue.number}."
