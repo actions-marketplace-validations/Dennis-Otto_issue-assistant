@@ -26,7 +26,7 @@ from .constants import (
     POSSIBLE_DUPLICATE,
     STALE,
 )
-from .digests import asked_since, asking, closing_day
+from .digests import asked_since, asking, awaits_reopening, closing_day
 from .errors import GitHubError, SweepIncomplete
 from .github import GitHub
 from .issues import (
@@ -68,15 +68,56 @@ CLOSING_KEYWORD = re.compile(
     re.IGNORECASE,
 )
 # GitHub links the issue also where the words before the keyword say the opposite,
-# as in "This doesn't close #12" or "Partly fixes #12": a negation or a part among
-# the last DENIAL_WORDS words of the clause before it, which a mark such as a comma
-# ends, within the DENIAL_REACH characters before the keyword. A negation that the
-# next word makes an emphasis, as in "Not only fixes #12", doesn't deny it.
+# as in "This doesn't close #12" or "Partly fixes #12": a negation or a part that
+# governs the keyword, right before it or with only fillers of DENIAL_FILLERS in
+# between, as in "does not yet fully resolve #12", or through an infinitive, as in
+# "is not meant to close #12" or "will not be able to fix #12" (DENIAL_INFINITIVES),
+# within the clause before it, which a mark such as a comma or a dash ends, and the
+# DENIAL_REACH characters
+# before the keyword. Any other word in between, such as "and", "which", "this" or
+# the "only" of "Not only fixes #12", belongs to another thought: "The cache didn't
+# refresh and this fixes #12" describes the bug and fixes it.
 DENIAL = re.compile(r"not|never|cannot|partially|partly|\w+n['’]t", re.IGNORECASE)
-EMPHASIS = re.compile(r"only|just|merely|simply", re.IGNORECASE)
-CLAUSE_END = re.compile(r"[.,;:!?()\[\]\n]")
+DENIAL_FILLERS = tuple(
+    tuple(filler.split())
+    for filler in (
+        "actually",
+        "alone",
+        "by itself",
+        "completely",
+        "entirely",
+        "fully",
+        "necessarily",
+        "on its own",
+        "quite",
+        "really",
+        "totally",
+        "yet",
+    )
+)
+# The verbs of an intent or an ability before the "to" of an infinitive through
+# which a negation governs the keyword, as in "doesn't try to fix #12".
+DENIAL_INFINITIVES = frozenset(
+    (
+        "able",
+        "aim",
+        "aims",
+        "attempt",
+        "attempting",
+        "attempts",
+        "designed",
+        "expected",
+        "going",
+        "intended",
+        "meant",
+        "planned",
+        "supposed",
+        "try",
+        "trying",
+    )
+)
+CLAUSE_END = re.compile(r"[.,;:!?()\[\]\n–—]|\s-\s")
 CLAUSE_WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)?")
-DENIAL_WORDS = 4
 DENIAL_REACH = 80
 
 # Runs a step of the sweep, named for the log, and returns what it did.
@@ -198,13 +239,36 @@ def denies_closing(text: str, repository: str, number: int) -> bool:
             continue
         start = match.start()
         clause = CLAUSE_END.split(text[max(0, start - DENIAL_REACH) : start])[-1]
-        words = CLAUSE_WORD.findall(clause)[-DENIAL_WORDS:]
-        if any(
-            DENIAL.fullmatch(word) and not EMPHASIS.fullmatch(after)
-            for word, after in zip(words, [*words, ""][1:], strict=True)
-        ):
+        if governs(CLAUSE_WORD.findall(clause)):
             return True
     return False
+
+
+def governs(words: list[str]) -> bool:
+    """Whether the words before a keyword end with a negation of it.
+
+    That is a negation or a part, followed by nothing but the fillers of
+    DENIAL_FILLERS, such as "yet" and "fully" in "does not yet fully resolve", or
+    by an infinitive, such as "meant to" or "be able to", with fillers in between.
+    """
+    words = without_fillers([word.lower() for word in words])
+    if words[-1:] == ["to"]:
+        words = without_fillers(words[:-1])
+        if words and words[-1] in DENIAL_INFINITIVES:
+            words = without_fillers(words[:-1])
+            if words and words[-1] in ("be", "being"):
+                words = without_fillers(words[:-1])
+    return bool(words) and bool(DENIAL.fullmatch(words[-1]))
+
+
+def without_fillers(words: list[str]) -> list[str]:
+    """The words without the fillers of DENIAL_FILLERS at their end."""
+    while filler := next(
+        (filler for filler in DENIAL_FILLERS if tuple(words[-len(filler) :]) == filler),
+        None,
+    ):
+        words = words[: -len(filler)]
+    return words
 
 
 def mark_fixed(github: GitHub, now: datetime, isolate: Isolate = directly) -> list[str]:
@@ -229,11 +293,14 @@ def mark_fixed(github: GitHub, now: datetime, isolate: Isolate = directly) -> li
             if not github.owns(reference) or reference["state"] == "CLOSED":
                 continue
             if denies_closing(pull["body"], github.repository, number):
-                command(
-                    "notice",
+                # In the summary of the sweep as well, where a maintainer sees an
+                # issue that a reworded description would label.
+                denied = (
                     f"#{number}: #{pull['number']} names it after words against"
-                    " the fix; it stays open.",
+                    " the fix; it stays open."
                 )
+                command("notice", denied)
+                done.append(denied)
                 continue
             done += isolate(
                 f"#{number}",
@@ -405,6 +472,28 @@ def close_issue_released(
     return [f"#{number}: closed, released in {release['tag_name']}."]
 
 
+def reopened_by_hand(
+    github: GitHub, number: int, comments: list[dict[str, Any]], since: datetime
+) -> bool:
+    """Whether someone other than the assistant reopened the issue after the sweep
+    closed it for a missing answer, since the waiting began.
+
+    Such an issue keeps its labels, which only the reporter's answer takes away, and
+    a reopening is no question that starts a new waiting.
+    """
+    closings = [
+        created(comment)
+        for comment in comments
+        if kind_of(comment) == "closed-unanswered" and created(comment) >= since
+    ]
+    return bool(closings) and any(
+        event["event"] == "reopened"
+        and login(event.get("actor")) != BOT
+        and created(event) > closings[-1]
+        for event in github.events(number)
+    )
+
+
 def sweep_waiting(
     github: GitHub, issue: dict[str, Any], now: datetime, lifecycle: Lifecycle
 ) -> list[str]:
@@ -413,7 +502,8 @@ def sweep_waiting(
 
     An answer is a comment or an edit of the text by the reporter after the last
     question. The closing comes on the day that the reminder named. An exempt issue
-    goes on waiting without a reminder and never closes.
+    goes on waiting without a reminder and never closes, and one that someone
+    reopened by hand after its closing waits no longer.
     """
     number = issue["number"]
     author = login(issue.get("user"))
@@ -431,6 +521,13 @@ def sweep_waiting(
             if name in current:
                 github.remove_label(number, name)
         return [f"#{number}: the reporter answered; no longer waiting."]
+    if reopened_by_hand(github, number, comments, since):
+        # Whoever reopened it takes it over; their next question waits anew.
+        for name in (NEEDS_INFO, STALE):
+            if name in current:
+                github.remove_label(number, name)
+        github.add_labels(number, [NEEDS_TRIAGE])
+        return [f"#{number}: reopened by hand; no longer waiting."]
     exempt = exemption(issue, lifecycle)
     if exempt:
         if STALE not in current:
@@ -614,12 +711,17 @@ def lock_issue(
     issue.
 
     The line comes once, also when GitHub failed the lock after it. An issue that
-    someone unlocked stays unlocked: they want its conversation to go on.
+    someone unlocked stays unlocked: they want its conversation to go on. So does
+    one whose reporter objected to its closing as a duplicate, until a maintainer
+    answered or decided otherwise: the closing comment promised them that a comment
+    is enough.
     """
     number = issue["number"]
     if any(event["event"] == "unlocked" for event in github.events(number)):
         return []
     comments = github.comments(number)
+    if awaits_reopening(issue, comments):
+        return []
     if not any(kind_of(comment) == "locked" for comment in comments):
         language = issue_language(issue, comments)
         github.comment(number, render_locked(language, lifecycle))

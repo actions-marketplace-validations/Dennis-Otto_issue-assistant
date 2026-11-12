@@ -37,17 +37,22 @@ PACKAGE = Path(assistant.__file__).parent
 REPOSITORY = "owner/project"
 # When the alerts of make_alert opened.
 OPENED = "2026-11-08T04:08:48Z"
+# The commit hash that the sample repository installs the assistant with, and that
+# the tests analyze.
+REF = "0123456789abcdef0123456789abcdef01234567"
+# A commit that the repository's checkout doesn't have, such as one of a fork.
+FORK_COMMIT = "fedcba9876543210fedcba9876543210fedcba98"
 # The settings that the property tests and the fuzzers clean with: a repository, a
-# kind of issue and one site besides GitHub that links may lead to.
+# kind of issue, one site besides GitHub that links may lead to, and the refs of the
+# checkout that a link into the repository may name.
 CONFIG = assistant.Config(
     root=Path("."),
     repository=REPOSITORY,
     labels=(assistant.Label("bug", "d73a4a", "Bug", "type"),),
     project="A project.",
     hosts=frozenset({"docs.example.com"}),
+    refs=frozenset({"main", "release/1.x", "v1.0.0", REF}),
 )
-# The commit hash that the sample repository installs the assistant with.
-REF = "0123456789abcdef0123456789abcdef01234567"
 NOW = datetime(2026, 10, 7, 12, tzinfo=UTC)
 BOT_USER = {"login": "github-actions[bot]", "type": "Bot"}
 BUG_BODY = """### What happened?
@@ -85,6 +90,22 @@ def earlier_form_fields(body):
         value = match[2].strip()
         fields[match[1].strip()] = "" if value == "_No response_" else value
     return fields
+
+
+def earlier_form_fields_outside_code(body):
+    """The earlier reading of a form, with the headings in fenced code as text: a
+    NUL before each keeps the earlier pattern from taking it for one, and goes again
+    from the answers. The body must hold no NUL of its own."""
+    rows = body.split("\n")
+    code = assistant.fenced([row.removesuffix("\r") for row in rows])
+    masked = "\n".join(
+        "\0" + row if in_code and row.startswith("###") else row
+        for row, in_code in zip(rows, code, strict=True)
+    )
+    return {
+        label: value.replace("\0", "")
+        for label, value in earlier_form_fields(masked).items()
+    }
 
 
 def at(days_ago: float = 0) -> str:
@@ -1442,6 +1463,9 @@ def run_main(monkeypatch, tmp_path, root, github, *argv, **env):
     monkeypatch.setenv("GH_REPO", REPOSITORY)
     for key in (
         "DRY_RUN",
+        # The keys of the records of the findings, which the Findings workflow sets.
+        "RECORD_KEY",
+        "NEWEST_RECORD_KEY",
         "ISSUE",
         "MODE",
         "RESULT",

@@ -8,6 +8,7 @@ tests/oracle.py sees it. The reading of issues, which anyone writes, is checked 
 same way against how it read them before.
 """
 
+import collections
 import dataclasses
 import json
 import re
@@ -22,13 +23,16 @@ import issue_assistant as assistant
 from oracle import PARSER, problems
 from support import (
     BOT_USER,
+    BOX,
     CONFIG,
     EARLIER_HTML,
     ESCAPES,
+    FORK_COMMIT,
     REPOSITORY,
     answer_of,
     at,
     earlier_form_fields,
+    earlier_form_fields_outside_code,
     make_answer,
     make_comment,
     make_discussion_answer,
@@ -77,6 +81,9 @@ PIECES = st.sampled_from(
         "https://evil.example/x",
         "https://docs.example.com/page",
         f"https://github.com/{REPOSITORY}/blob/main/README.md",
+        # A commit that the checkout doesn't have, such as one of a fork.
+        f"https://github.com/{REPOSITORY}/blob/{FORK_COMMIT}/install.sh",
+        f"https://github.com/{REPOSITORY}/tree/{FORK_COMMIT}",
         "https://github.com/other/repo/blob/main/x",
         "HTTPS://evil.example",
         "www.evil.example",
@@ -395,6 +402,11 @@ TOKENS = st.one_of(
     st.from_regex(r"github_pat_[A-Za-z0-9_]{60}", fullmatch=True),
     st.from_regex(r"sk-ant-[A-Za-z0-9_-]{30}", fullmatch=True),
     st.from_regex(r"AKIA[0-9A-Z]{16}", fullmatch=True),
+    st.from_regex(r"AIza[0-9A-Za-z_-]{35}", fullmatch=True),
+    st.from_regex(r"glpat-[A-Za-z0-9_-]{20}", fullmatch=True),
+    st.from_regex(r"[sr]k_live_[A-Za-z0-9]{24}", fullmatch=True),
+    st.from_regex(r"hf_[A-Za-z0-9]{34}", fullmatch=True),
+    st.from_regex(r"[0-9]{10}:[A-Za-z0-9_-]{35}", fullmatch=True),
 )
 
 
@@ -466,7 +478,12 @@ KANA = letters_named("HIRAGANA LETTER", "KATAKANA LETTER", "HALFWIDTH KATAKANA L
 HAN = letters_named("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH-")
 HANGUL = letters_named("HANGUL SYLLABLE")
 SCRIPTS = {
+    "de": list("ßẞ"),
+    "es": list("ñÑ¿¡"),
+    "fr": list("œŒ"),
+    "it": list("ìòÌÒ"),
     "ko": HANGUL,
+    "pt": list("ãõÃÕ"),
     "ru": list("ёъыэЁЪЫЭ"),
     "uk": list("ґєіїҐЄІЇ"),
     "zh": HAN,
@@ -562,6 +579,19 @@ def test_any_form_reads_as_it_always_did(body):
     assert assistant.form_fields(body) == earlier_form_fields(body)
 
 
+@given(FORM)
+def test_an_excerpt_reads_a_form_as_before_but_for_headings_in_code(body):
+    # Only a heading in fenced code reads differently for an excerpt: as text.
+    hypothesis.assume(headings_have_labels(body) and "\0" not in body)
+    fields = dict(assistant.form_parts(body, outside_code=True)[1])
+    assert fields == earlier_form_fields_outside_code(body)
+
+
+@given(FORM)
+def test_no_text_before_a_ticked_box_hides_it(body):
+    assert assistant.box_ticked(body + BOX.format("X"), CONFIG)
+
+
 HTML_TEXT = st.lists(
     st.sampled_from(
         ["<", ">", "/", "!", "-", "a", "B", " ", "\n", "<!--", "-->", "<b>", "</i>"]
@@ -647,9 +677,95 @@ def subsequence(part, whole):
     return all(char in rest for char in part)
 
 
+# Text made of the pieces of link reference definitions and footnotes, and of the
+# blocks around them.
+DEFINITIONS = st.lists(
+    st.sampled_from(
+        [
+            "[x]:",
+            "[^x]:",
+            "[^x]",
+            "[",
+            "]",
+            "\\",
+            "#",
+            "/url",
+            "<>",
+            '"t"',
+            "'",
+            '"',
+            "(",
+            ")",
+            "\n",
+            "\n\n",
+            "\r\n",
+            " ",
+            "    ",
+            "\t",
+            "> ",
+            "- ",
+            "1. ",
+            "2) ",
+            "# ",
+            "===",
+            "```",
+            "~~~",
+            "<!--",
+            "-->",
+            "<div>",
+            "\u200b",
+            "x",
+        ]
+    ),
+    max_size=40,
+).map("".join)
+
+
+@hypothesis.settings(suppress_health_check=[hypothesis.HealthCheck.too_slow])
+@hypothesis.example('[x]: <> "hidden"')
+@hypothesis.example(" ```\n```\n[x]: # (hidden)")
+@hypothesis.example('[x]: #\n"hidden\n2. hidden"')
+@hypothesis.example('x\n\n[a]: <> "[^x]"\n\n[^x]: hidden')
+@given(st.one_of(st.text(), STRUCTURE, DEFINITIONS))
+def test_a_commonmark_parser_finds_no_definition_in_what_the_engine_reads(text):
+    """What is left of a text after the definitions went holds none, as a CommonMark
+    parser reads it, and only notes take their places. The parser reads a footnote
+    as a definition: one that a reference shows stays."""
+    shown, removed = assistant.shown_text(text)
+    environment = {}
+    tokens = PARSER.parse(shown, environment)
+    labels = environment.get("references", {})
+    assert not [label for label in labels if not label.startswith("^")]
+    # Each footnote that stays has a reference that the parser reads as a link.
+    assert {
+        label for label in labels if label[1:].isalnum() and label[1:].isascii()
+    } <= set(references(tokens))
+    notes = (assistant.DEFINITION_NOTE, assistant.FOOTNOTE_NOTE)
+    assert sum(shown.count(note) for note in notes) >= removed
+    for note in notes:
+        shown = shown.replace(note, "")
+    assert subsequence(shown, assistant.strip_html(text))
+
+
+def references(tokens):
+    """The text of each link and image, as the parser writes the label of one."""
+    for token in tokens:
+        text = None
+        for child in token.children or ():
+            if child.type == "link_open":
+                text = ""
+            elif child.type == "link_close":
+                yield " ".join(text.split()).upper()
+                text = None
+            elif text is not None:
+                text += child.content
+            elif child.type == "image":
+                yield " ".join(child.content.split()).upper()
+
+
 @hypothesis.example("<!-- -\u200b->\nhidden")
 @hypothesis.example("<!-- x -\u200b-> hidden -->")
-@given(st.one_of(st.text(), STRUCTURE))
+@given(st.one_of(st.text(), STRUCTURE, DEFINITIONS))
 def test_the_engine_reads_no_text_that_github_hides(text):
     """What a fence of issue.md holds is what GitHub shows of the text, without its
     invisible characters: taken out before the HTML, one could end an HTML comment
@@ -657,5 +773,47 @@ def test_the_engine_reads_no_text_that_github_hides(text):
     rendered = assistant.rendered_text(text, assistant.Visible())
     marks, _, rest = rendered.partition("\n")
     inner = rest[: rest.rfind("\n" + marks)]
-    assert subsequence(inner, assistant.strip_html(text))
+    assert subsequence(inner, assistant.shown_text(text)[0])
     assert not assistant.INVISIBLE.search(inner)
+
+
+# Forms with HTML: headings, answers, comments and tags with attributes.
+FORM_HTML = st.lists(
+    st.sampled_from(
+        [
+            "### What happened\n\n",
+            "### Version\n\n",
+            "_No response_",
+            "<!--",
+            "-->",
+            '<img alt="Xyzzy">',
+            '<a title="Xyzzy">',
+            "</a>",
+            "<",
+            ">",
+            "\n",
+            " ",
+            "x",
+        ]
+    ),
+    max_size=30,
+).map("".join)
+
+
+@hypothesis.example("### What happened\n\n<!-- Xyzzy\n\n### Version\n\n1.2")
+@hypothesis.example('Card is empty.\n<img alt="Xyzzy">')
+@given(st.one_of(st.text(), STRUCTURE, FORM_HTML))
+def test_an_excerpt_reads_nothing_that_issue_md_leaves_out(text):
+    """Each character of an excerpt is one that the fence of issue.md holds for the
+    same text: what GitHub hides there, the excerpts in the JSON files hide as well.
+    Left out are the white space, which both shorten in their own ways, and what the
+    excerpt writes itself: the colon after the label of a field and the ellipsis of
+    a shortened excerpt."""
+    rendered = assistant.rendered_text(text, assistant.Visible())
+    marks, _, rest = rendered.partition("\n")
+    inner = rest[: rest.rfind("\n" + marks)]
+    written = assistant.Visible()(assistant.excerpt(text, 1500))
+    kept = collections.Counter(
+        char for char in written if not char.isspace() and char not in ":…"
+    )
+    assert kept <= collections.Counter(inner)

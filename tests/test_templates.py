@@ -2091,32 +2091,61 @@ def start_script():
 
 
 # The GitHub CLI of the job start, as a shell function: it notes its arguments and
-# answers with the run that GitHub started and that run's conclusion.
+# answers with the run that GitHub started, with 404 to the first MISSING questions
+# for that run, as GitHub does in the first moments after the dispatch, and with
+# that run's conclusion. sleep only notes how long the step would wait.
 FAKE_GH = """
 gh() {
   echo "gh $*" >> "$CALLS"
-  case "$1 $2" in
-    "api --header") [[ -z "$RUN" ]] || echo "$RUN" ;;
-    "run view") echo "$CONCLUSION" ;;
+  case "$*" in
+    *" --method POST "*) [[ -z "$RUN" ]] || echo "$RUN" ;;
+    "api --header "*" repos/$GH_REPO/actions/runs/"*)
+      if ((MISSING > 0)); then
+        MISSING=$((MISSING - 1))
+        echo "failed to get run: HTTP 404: Not Found" >&2
+        return 1
+      fi
+      ;;
+    "run view "*) echo "$CONCLUSION" ;;
   esac
+}
+sleep() {
+  echo "sleep $*" >> "$CALLS"
 }
 """
 
+# How often the step asks for the run before it gives up, and how long it waits
+# between two questions: about a minute in all.
+CANARY_LOOKUPS = 12
+CANARY_LOOKUP_PAUSE = "sleep 5"
+
 
 @pytest.mark.parametrize(
-    ("run", "conclusion", "code", "says"),
+    ("run", "missing", "conclusion", "code", "says"),
     [
-        ("42", "success", 0, "The canary passed."),
+        ("42", 0, "success", 0, "The canary passed."),
         # A later push's canary took the place of its waiting analysis.
-        ("42", "cancelled", 0, "::notice::The canary was cancelled"),
-        ("42", "failure", 1, "::error::The canary ended as failure: "),
-        ("42", "timed_out", 1, "::error::The canary ended as timed_out: "),
+        ("42", 0, "cancelled", 0, "::notice::The canary was cancelled"),
+        ("42", 0, "failure", 1, "::error::The canary ended as failure: "),
+        ("42", 0, "timed_out", 1, "::error::The canary ended as timed_out: "),
+        # GitHub may not serve the run that it just named for a moment.
+        ("42", 2, "success", 0, "The canary passed."),
+        ("42", CANARY_LOOKUPS - 1, "failure", 1, "::error::The canary ended as "),
+        # Nor for a minute, and then the run's page has its result.
+        (
+            "42",
+            CANARY_LOOKUPS,
+            "",
+            0,
+            "::warning::GitHub doesn't show the canary's run after a minute; "
+            "its result is at https://github.com/octo/assistant/actions/runs/42",
+        ),
         # GitHub may start a run without naming it.
-        ("", "", 0, "::warning::GitHub started the canary without naming its run"),
+        ("", 0, "", 0, "::warning::GitHub started the canary without naming its run"),
     ],
 )
 def test_the_push_fails_when_the_canary_that_it_started_fails(
-    tmp_path, run, conclusion, code, says
+    tmp_path, run, missing, conclusion, code, says
 ):
     """GitHub mails a failed run to the person who started it, and nobody started
     the canary's run after a push but the job's token: the push's own run, which
@@ -2125,6 +2154,7 @@ def test_the_push_fails_when_the_canary_that_it_started_fails(
     env = {
         "CALLS": str(calls),
         "RUN": run,
+        "MISSING": str(missing),
         "CONCLUSION": conclusion,
         "GH_REPO": "octo/assistant",
         "GITHUB_REF_NAME": "main",
@@ -2149,10 +2179,20 @@ def test_the_push_fails_when_the_canary_that_it_started_fails(
     if run:
         url = "https://github.com/octo/assistant/actions/runs/42"
         assert f"The canary runs at {url}" in result.stdout
-        assert rest == [
-            "gh run watch 42 --interval 60",
-            "gh run view 42 --json conclusion --jq .conclusion",
-        ]
+        lookup = (
+            f"gh api --header {assistant.API_VERSION_HEADER} "
+            "repos/octo/assistant/actions/runs/42 --silent"
+        )
+        lookups = min(missing + 1, CANARY_LOOKUPS)
+        waited = [lookup, CANARY_LOOKUP_PAUSE] * (lookups - 1) + [lookup]
+        if missing < CANARY_LOOKUPS:
+            assert rest == [
+                *waited,
+                "gh run watch 42 --interval 60",
+                "gh run view 42 --json conclusion --jq .conclusion",
+            ]
+        else:
+            assert rest == waited
         if code:
             assert result.stdout.rstrip().endswith(url)
     else:
@@ -2846,7 +2886,7 @@ def test_the_findings_workflow_may_only_dismiss_alerts_and_runs_no_ai():
     assert "head_repository.full_name == github.repository" in condition
     assert "head_branch == github.event.repository.default_branch" in condition
     assert "workflow_run.event == 'pull_request'" in condition
-    _, _, _, guard, checkout, tool, record, step, keep, _ = job["steps"]
+    _, _, _, guard, checkout, tool, newest, record, step, keep, _ = job["steps"]
     assert guard["name"] == GUARD["name"]
     assert checkout["with"] == {"persist-credentials": False}
     assert tool["with"] == TOOL_CHECKOUT and step["uses"] == TOOL
@@ -2864,15 +2904,17 @@ def test_the_findings_keep_the_record_of_the_reported_alerts_in_the_cache():
     names = [step.get("name") for step in job["steps"]]
     restore = step_named(reader, "Restore the record of the reported alerts")
     check = step_named(reader, "Check the record of the reported alerts")
+    newest = step_named(job, "Look up the newest record of the reported alerts")
     put = step_named(job, "Put the record of the reported alerts in place")
     keep = step_named(job, "Keep the record of the reported alerts")
     findings = names.index("Dismiss accepted findings and report the others")
     # After the checkouts, whose clean would remove the record, around the findings.
+    assert names.index(newest["name"]) == findings - 2
     assert names.index(put["name"]) == findings - 1
     assert names.index(keep["name"]) == findings + 1
     record = assistant.FINDINGS_RECORD.as_posix()
     hashed = f"hashFiles('{record}')"
-    for step, part in ((restore, "restore"), (keep, "save")):
+    for step, part in ((restore, "restore"), (newest, "restore"), (keep, "save")):
         action, _, ref = step["uses"].partition("@")
         assert action == f"actions/cache/{part}" and assistant.SHA.fullmatch(ref)
         # A cache that fails or hangs stops neither the findings nor the job.
@@ -2883,6 +2925,21 @@ def test_the_findings_keep_the_record_of_the_reported_alerts_in_the_cache():
     assert restore["with"]["key"] == FINDINGS_CACHE + "${{ github.run_id }}"
     assert restore["with"]["restore-keys"] == FINDINGS_CACHE
     assert "if" not in restore
+    # The runs after the scans of a push overlap, and the job record of one reads the
+    # record before the run ahead keeps a newer one at its end: once the findings'
+    # turn has come in their group, after the run ahead, they look up the key of the
+    # newest record by the same keys, without downloading it, and the issue assistant
+    # fails for no alert of a record that a newer one replaced.
+    assert newest["id"] == "newest"
+    assert newest["with"] == {**restore["with"], "lookup-only": True}
+    assert newest["if"] == "needs.record.outputs.key != ''"
+    assert "concurrency" in job and "concurrency" not in reader
+    assert step_named(job, "Dismiss accepted findings and report the others")[
+        "env"
+    ] == {
+        "RECORD_KEY": "${{ needs.record.outputs.key }}",
+        "NEWEST_RECORD_KEY": "${{ steps.newest.outputs.cache-matched-key }}",
+    }
     assert reader["outputs"] == {
         "record": "${{ steps.check.outputs.record }}",
         "key": "${{ steps.restore.outputs.cache-matched-key }}",
@@ -2929,11 +2986,13 @@ def test_no_job_that_may_write_unpacks_a_cache():
     assistant and hands on only a record that it checked (decision 0026)."""
     for name in NAMES:
         for job_name, job in load(reusable(name))["jobs"].items():
+            # A lookup asks for the key alone, and downloads and unpacks nothing.
             restores = [
                 step
                 for step in job["steps"]
                 if step.get("uses", "").startswith("actions/cache")
                 and not step["uses"].startswith("actions/cache/save@")
+                and step.get("with", {}).get("lookup-only") is not True
             ]
             if (name, job_name) == ("findings.yml", RECORD_JOB):
                 assert job["permissions"] == {}
