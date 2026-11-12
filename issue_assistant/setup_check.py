@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from collections.abc import Callable
@@ -31,14 +32,18 @@ from .languages import LANGUAGES, LOCALES, texts
 from .paths import (
     CHOOSER_REPOSITORY,
     CONTEXT,
+    DEPENDABOT_FILES,
     DISCUSSION_WORKFLOW,
     FINDINGS_FILE,
     FIREWALL,
     FORMS,
     LABELS_FILE,
+    RENOVATE_FILES,
+    RENOVATE_PACKAGE,
     SETTINGS,
     TEMPLATE_WORKFLOWS,
     TEMPLATES,
+    UPDATES_GUIDE,
     VERSION_FILE,
     WORKFLOWS,
 )
@@ -47,6 +52,7 @@ from .settings import (
     Config,
     Label,
     Lifecycle,
+    backlog_size,
     engine_problems,
     is_repository,
     lifecycle_problems,
@@ -72,7 +78,12 @@ HOST_NAME = re.compile(
 # The reasons GitHub accepts for dismissing a code scanning alert.
 DISMISS_REASONS = ("false positive", "won't fix", "used in tests")
 
-LIMITS = ("max_per_day", "max_per_author_per_day", "release_replies")
+LIMITS = (
+    "max_per_day",
+    "max_per_author_per_day",
+    "release_replies",
+    "backlog_per_run",
+)
 
 CONTEXT_LIMITS = ("max_issues", "max_discussions", "max_analyzed")
 
@@ -96,6 +107,15 @@ MIN_PROJECT = 80
 
 # The longest title of an issue that GitHub takes.
 MAX_TITLE = 256
+
+# An entry of Dependabot's configuration for the actions and reusable workflows of
+# the workflows, in block style, as GitHub's docs write it; a line in a comment
+# doesn't count.
+DEPENDABOT_ACTIONS = re.compile(
+    r"""^[ \t-]*["']?package-ecosystem["']?[ \t]*:[ \t]*["']?github-actions["']?"""
+    r"[ \t]*(?:#.*)?$",
+    re.MULTILINE,
+)
 
 
 def normalized(node: Any, problems: list[str], where: str) -> Any:
@@ -453,7 +473,11 @@ def check_config(config: Config) -> list[str]:
     problems += engine_problems(config)
     for key in (*LIMITS, *CONTEXT_LIMITS):
         try:
-            limit(config, key)
+            # The backlog has a top as well: the size of a matrix.
+            if key == "backlog_per_run":
+                backlog_size(config)
+            else:
+                limit(config, key)
         except AssistantError as error:
             problems.append(str(error))
     if config.engine in ENGINES:
@@ -695,6 +719,57 @@ def check_project(config: Config) -> list[str]:
             "what it does, for whom, and where its code and documentation are"
         ]
     return []
+
+
+def renovate_in_package(root: Path) -> bool:
+    """Whether package.json in `root` holds a configuration of Renovate under its
+    key "renovate", which Renovate reads as well as a file of its own."""
+    path = root / RENOVATE_PACKAGE
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except ValueError:
+        return False
+    return isinstance(data, dict) and "renovate" in data
+
+
+def updates_missing(root: Path) -> str:
+    """Why the pins of the issue assistant in the workflows of the repository in
+    `root` never move to a new release, for `install` and a warning of `check`;
+    empty when a configuration of Renovate or Dependabot's ecosystem github-actions
+    moves them.
+
+    A warning, never a problem: a repository may run Renovate from elsewhere, such
+    as an app of its organization with a shared preset, without a file of its own.
+    """
+    if any((root / name).is_file() for name in RENOVATE_FILES) or renovate_in_package(
+        root
+    ):
+        return ""
+    dependabot = [name for name in DEPENDABOT_FILES if (root / name).is_file()]
+    if any(
+        DEPENDABOT_ACTIONS.search(
+            (root / name).read_text(encoding="utf-8", errors="replace")
+        )
+        for name in dependabot
+    ):
+        return ""
+    cause = (
+        f"{dependabot[0]} updates no package-ecosystem github-actions, and no "
+        "configuration of Renovate is there"
+        if dependabot
+        else "neither Dependabot nor Renovate is configured"
+    )
+    return (
+        f"{cause}, so the pins of the issue assistant in {WORKFLOWS} stay on this "
+        "release, and its fixes, security fixes among them, never arrive: add the "
+        f"package-ecosystem github-actions for the directory / to "
+        f"{DEPENDABOT_FILES[0]}, or a configuration of Renovate, such as "
+        f"{RENOVATE_FILES[0]}, as {UPDATES_GUIDE} shows. A repository that runs "
+        "Renovate from elsewhere, such as with a preset of its organization, can "
+        "leave it so"
+    )
 
 
 def check(config: Config) -> list[str]:

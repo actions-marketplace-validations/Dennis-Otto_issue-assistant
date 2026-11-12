@@ -967,6 +967,89 @@ def test_an_answer_reopens_an_issue_closed_without_one(config):
     assert "I reopened the issue" in reopened and "@reporter" in reopened
 
 
+def test_an_edit_reopens_an_issue_closed_without_an_answer(config):
+    """The questions offer an answer by an edit of the issue, and the closing
+    comment promises that an answer reopens it: an edit of the text does, as a
+    comment does."""
+    github = closed_unanswered(config)
+    changes = github.edit(12, "reporter", body=f"{BUG_BODY}\nVersion 1.9.0")
+    plan = assistant.handle_event(
+        github, "issues", event("edited", github.issue(12), changes=changes), config
+    )
+    assert (plan.issue, plan.mode, plan.notes) == (
+        12,
+        "follow-up",
+        ["Reopened after the reporter's answer."],
+    )
+    # The follow-up answers the questions of the analysis.
+    assert plan.answers["id"] == 1
+    assert github.store[12]["state"] == "open"
+    assert github.labels_of(12) == {"bug", "needs-triage"}
+    (reopened,) = github.posted(12)
+    assert "I reopened the issue" in reopened and "@reporter" in reopened
+
+
+def test_an_answer_saved_with_a_tick_reopens_the_issue_without_the_ai(config):
+    """An edit that adds the answer and ticks the box of the form reopens the issue
+    closed without an answer, and the mute stops its follow-up."""
+    github = closed_unanswered(config)
+    github.store[12]["body"] = BOX_UNTICKED
+    changes = github.edit(12, "reporter", body=f"The log says this.\n\n{BOX_TICKED}")
+    plan = assistant.handle_event(
+        github, "issues", event("edited", github.issue(12), changes=changes), config
+    )
+    assert plan.mode == "none"
+    assert plan.notes[:2] == [TICKED_NOTE, "Reopened after the reporter's answer."]
+    assert github.store[12]["state"] == "open"
+    assert github.labels_of(12) == {"bug", "needs-triage", "assistant-muted"}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "other person",
+        "closed by a person",
+        "no marker",
+        "released",
+        "duplicate",
+        "locked",
+    ],
+)
+def test_other_edits_of_closed_issues_leave_them_closed(config, case):
+    """Only the closing for a missing answer promises that an edit of the reporter
+    reopens the issue; after a release or as a duplicate, a comment does."""
+    github = closed_unanswered(config)
+    editor = "someone" if case == "other person" else "reporter"
+    if case == "closed by a person":
+        github.event_store[12][-1]["actor"] = {"login": "maintainer", "type": "User"}
+    if case == "no marker":
+        github.comment_store[12] = github.comment_store[12][:1]
+    for kind in ("released", "duplicate"):
+        if case == kind:
+            name = "closed-duplicate" if kind == "duplicate" else kind
+            closing = f"{assistant.render_marker(name, lang='en')}\nClosed"
+            github.comment_store[12][-1] = make_comment(2, "bot", closing, 0.5)
+    if case == "locked":
+        # The sweep locked it; its reporter may still edit its text.
+        github.store[12]["locked"] = True
+    changes = github.edit(12, editor, body=f"{BUG_BODY}\nVersion 1.9.0")
+    plan = assistant.handle_event(
+        github,
+        "issues",
+        event("edited", github.issue(12), editor, changes=changes),
+        config,
+    )
+    why = {
+        "other person": "Edit without a pending question.",
+        "closed by a person": "Closed by a person: stays closed.",
+        "locked": "Locked: stays closed.",
+    }.get(case, "Not closed for a missing answer.")
+    assert (plan.issue, plan.mode, plan.notes) == (12, "none", [why])
+    assert github.store[12]["state"] == "closed"
+    assert github.labels_of(12) == {"bug", "needs-info", "stale"}
+    assert not github.writes_made()
+
+
 def test_a_reopened_issue_without_the_assistant_s_questions_goes_to_the_maintainer(
     config,
 ):
@@ -2333,6 +2416,12 @@ def test_a_limit_that_is_no_whole_number_stops_the_run(config, key, value):
     with pytest.raises(assistant.AssistantError, match=f"{key} must be a whole number"):
         if key == "release_replies":
             comment_after_release(github, broken)
+        elif key == "backlog_per_run":
+            inputs = {"issue": "0", "mode": assistant.BACKLOG}
+            payload = {"inputs": inputs}
+            assistant.handle_event(
+                github, "workflow_dispatch", payload, broken, "owner"
+            )
         else:
             opened(github, broken)
 
@@ -9079,6 +9168,49 @@ def test_a_read_that_github_failed_runs_again_after_2_4_and_8_seconds(
     with pytest.raises(assistant.GitHubError, match="HTTP 502"):
         assistant.GitHub(REPOSITORY).graphql("query { viewer { login } }", {})
     assert len(commands) == 4 and waits == [2, 4, 8]
+
+
+@pytest.mark.parametrize(
+    ("message", "again"),
+    [
+        # The words of gh, from Go's net/http, when the connection broke off.
+        ('Get "https://api.github.com/x": read: connection reset by peer', True),
+        ('Get "https://api.github.com/x": EOF', True),
+        ('Post "https://api.github.com/graphql": unexpected EOF', True),
+        ("dial tcp 140.82.121.6:443: connect: connection refused", True),
+        ("dial tcp 140.82.121.6:443: connect: connection timed out", True),
+        ("dial tcp: lookup api.github.com: no such host", True),
+        ("dial tcp: lookup api.github.com on 127.0.0.53:53: server misbehaving", True),
+        ("lookup api.github.com: i/o timeout", True),
+        ("net/http: TLS handshake timeout", True),
+        ("net/http: timeout awaiting response headers", True),
+        (
+            'Get "https://api.github.com/x": context deadline exceeded'
+            " (Client.Timeout exceeded while awaiting headers)",
+            True,
+        ),
+        ("http2: server sent GOAWAY and closed the connection", True),
+        # No moment of GitHub: the same read would fail again.
+        ("To get started with GitHub CLI, please run:  gh auth login", False),
+        ("no EOFs here, as a word of its own", False),
+    ],
+)
+def test_a_read_runs_again_after_each_kind_of_broken_connection(
+    monkeypatch, tmp_path, message, again
+):
+    error = assistant.GitHubError.of(["api", "x"], "", f"gh: {message}\n")
+    assert (error.status, error.transient()) == (None, again)
+    # Whether a write happened is open, so it never runs again.
+    assert error.wait(1, False) is None
+    broken = Completed("", f"gh: {message}\n", 1)
+    commands, waits = gh_answers(monkeypatch, tmp_path, broken, DONE)
+    if again:
+        assert assistant.GitHub(REPOSITORY).issue(1) == {"number": 1}
+        assert len(commands) == 2 and waits == [2]
+    else:
+        with pytest.raises(assistant.GitHubError, match=re.escape(message)):
+            assistant.GitHub(REPOSITORY).issue(1)
+        assert len(commands) == 1 and waits == []
 
 
 def test_a_write_runs_again_only_when_github_refused_it(monkeypatch, tmp_path):
