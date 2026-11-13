@@ -12,6 +12,8 @@
 [![REUSE](https://api.reuse.software/badge/github.com/Dennis-Otto/issue-assistant)](https://api.reuse.software/info/github.com/Dennis-Otto/issue-assistant)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%99%A5-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/Dennis-Otto)
 
+[Auf Deutsch](https://github.com/Dennis-Otto/issue-assistant/blob/main/README.de.md)
+
 - **Prompt injection can't write.** The AI runs with tools that only read, behind a firewall and with a read-only token or none. Its answer reaches GitHub only through a job without AI that checks it against a schema, your labels and your issues.
 - **Answers worth reading.** The likely cause with links to the lines of code, what the reporter can try, the information still missing, duplicates and labels, in the reporter's language.
 - **The whole life of an issue.** Reminders and closing for unanswered issues, duplicates that close after three days, and fixed issues that close with the release that ships the fix, all without AI.
@@ -27,9 +29,9 @@ git clone --quiet --depth 1 --branch "$tag" https://github.com/Dennis-Otto/issue
 
 Then describe the project, clear one setting and try it on an issue, as [Set up a repository](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/getting-started.md#set-up-a-repository) shows. [Requirements](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/getting-started.md#requirements) lists what it needs, and the [FAQ](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/faq.md#what-does-it-cost) what it costs.
 
-Coming from the [GitHub Marketplace](https://github.com/marketplace/actions/read-only-issue-assistant)? Its *Use latest version* offers a bare step with an empty `command`; on its own, give it `command: check`, as in [Keep it checked](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/getting-started.md#keep-it-checked); `install` above writes the four workflows that run the assistant.
+Coming from the [GitHub Marketplace](https://github.com/marketplace/actions/read-only-issue-assistant)? Its *Use latest version* offers a bare step with an empty `command`; on its own, give it `command: check`, as in [Keep it checked](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/getting-started.md#keep-it-checked); `install` above writes the workflows that run the assistant.
 
-**See it live:** [the first analysis of a feature request in Paperless Sync](https://github.com/Dennis-Otto/paperless-sync/issues/84#issuecomment-6125470710), posted 2 minutes 39 seconds after the issue was opened.
+**See it live:** first analyses of [a bug](https://github.com/Dennis-Otto/homedarts-for-autodarts/issues/521#issuecomment-6547309975), traced into the code, of [a feature request](https://github.com/Dennis-Otto/paperless-sync/issues/84#issuecomment-6125470710) and of [one in the reporter's Chinese](https://github.com/Dennis-Otto/paperless-sync/issues/345#issuecomment-6582461804), with a summary for the maintainer, posted 2 min 32 s, 2 min 39 s and 3 min 7 s after each issue was opened.
 
 <picture>
   <source media="(prefers-reduced-motion: reduce) and (max-width: 600px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Dennis-Otto/issue-assistant/main/docs/images/hero-mobile-still-dark.webp">
@@ -44,7 +46,7 @@ Coming from the [GitHub Marketplace](https://github.com/marketplace/actions/read
 
 ## What it does
 
-A GitHub Action that looks after the issues of a repository. Each line leads to a page with a picture and the details:
+A GitHub Action that looks after the issues of a repository. Each line leads to a page with a picture and details:
 
 - **[The first analysis](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/first-analysis.md):** the likely cause with links to the code, what to try and what is missing, in the reporter's language.
 - <a name="the-life-of-an-issue"></a>**[The life of an issue](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/life-of-an-issue.md):** labels say where an issue stands, and the assistant keeps what its comments promise, without AI.
@@ -65,20 +67,20 @@ A GitHub Action that looks after the issues of a repository. Each line leads to 
 - **[Good first issue candidates](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/good-first-issues.md):** the digest names the issues that someone new could take; only a maintainer adds the label.
 - <a name="when-github-fails"></a>**[When GitHub fails](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/features/github-failures.md):** a rate limit, a server error or an incident never changes what the assistant posts.
 - **[Labels as code](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/configuration.md#githublabelstoml):** the labels of the repository in `.github/labels.toml`, from the issue forms and from the analysis, each with its reason.
-- **[Findings of code scanning](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/configuration.md#findings):** the findings that `.github/findings.toml` accepts are dismissed with their reason, also in a pull request, where their review threads would block the merge; any other open finding fails one run, the first after it opens, so GitHub mails about it once, without a public issue.
+- **[Findings of code scanning](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/configuration.md#findings):** the findings that `.github/findings.toml` accepts are dismissed with their reason, also in a pull request; any other open finding fails one run, so GitHub mails about it once, without a public issue.
 
-The maintainer reads every issue and has the last word. A first analysis looks like this, here on an issue of a demo project:
+The maintainer reads every issue and has the last word. A first analysis, on an issue of a demo project:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Dennis-Otto/issue-assistant/main/docs/images/analysis-dark.webp">
   <img src="https://raw.githubusercontent.com/Dennis-Otto/issue-assistant/main/docs/images/analysis-light.webp" alt="A first analysis of the issue assistant on an issue of a demo project: thanks to the reporter, a summary, the first analysis with the likely cause, what is worth trying, the information needed with the reminder after 15 days, a related issue, links to the line of code and the section of the troubleshooting guide, and a footer that names Claude and the label it added, links how the assistant works, asks for a thumbs up or down and links the project">
 </picture>
 
-**Used by** [HomeDarts for Autodarts](https://github.com/Dennis-Otto/homedarts-for-autodarts), [Player Switch for Autodarts](https://github.com/Dennis-Otto/player-switch-for-autodarts), [Paperless Unified Search](https://github.com/Dennis-Otto/paperless-unified-search), [Paperless Sync](https://github.com/Dennis-Otto/paperless-sync), the [repository blueprint](https://github.com/Dennis-Otto/repo-blueprint), the website [dennis-otto.github.io](https://github.com/Dennis-Otto/dennis-otto.github.io) and the issue assistant itself.
+**Used by** [HomeDarts for Autodarts](https://github.com/Dennis-Otto/homedarts-for-autodarts), [Player Switch for Autodarts](https://github.com/Dennis-Otto/player-switch-for-autodarts), [Paperless Unified Search](https://github.com/Dennis-Otto/paperless-unified-search), [Paperless Sync](https://github.com/Dennis-Otto/paperless-sync), [Repo Pager](https://github.com/Dennis-Otto/repo-pager), the [repository blueprint](https://github.com/Dennis-Otto/repo-blueprint), [dennis-otto.github.io](https://github.com/Dennis-Otto/dennis-otto.github.io) and the assistant itself.
 
 ## How it works
 
-Four workflows run in the repository, each a short one that pins a release of the issue assistant. Only the violet job runs an AI, and it can't write. [How it works](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/how-it-works.md) has what starts each of them and the task that each event gives the AI.
+Four workflows run in the repository, a fifth for discussions where `answer_categories` names categories, each a short one that pins a release of the issue assistant. Only the violet job runs an AI, and it can't write. [How it works](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/how-it-works.md) has what starts each of them and the task that each event gives the AI.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/diagrams/the-four-workflows-of-a-repository-and-what-starts-them.dark.svg">
@@ -150,11 +152,11 @@ The workflows that `install` writes choose their own runners: `ubuntu-24.04`, an
 | `ubuntu-26.04` | 3.14 | What `ubuntu-latest` means since 2026-10-19 |
 | `ubuntu-24.04-arm` | 3.12 | ARM, free in public repositories |
 
-The action needs Python 3.12 or newer as `python3`, with `gh` and `git`; `check` and `evaluate` also read YAML with PyYAML or `yq`. On an older Python, such as on `ubuntu-22.04`, on a self-hosted runner or after `actions/setup-python` with an older version, the action stops in its first step with an error that names the version it found and the fix: run the job on `ubuntu-24.04`, or add `actions/setup-python` with `python-version: 3.12` before the action.
+The action needs Python 3.12 or newer as `python3`, with `gh` and `git`; `check` and `evaluate` also read YAML with PyYAML or `yq`. On an older Python, such as on `ubuntu-22.04`, the action stops in its first step with an error that names the fix: run the job on `ubuntu-24.04`, or add `actions/setup-python` with `python-version: 3.12` before the action.
 
 ## Development
 
-See [CONTRIBUTING.md](https://github.com/Dennis-Otto/issue-assistant/blob/main/CONTRIBUTING.md). The script needs only Python 3.12's standard library, `gh` and `git`, which GitHub's runners have; `check` and `evaluate` read YAML with PyYAML or `yq`. The tests check every GraphQL request against GitHub's schema, [dry runs](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/architecture/dry-runs.md) run the path of an issue through the AI and each reusable workflow as a repository calls them, and a change of [a template](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/architecture/templates.md) reaches the repositories with a release.
+See [CONTRIBUTING.md](https://github.com/Dennis-Otto/issue-assistant/blob/main/CONTRIBUTING.md). The script needs only the standard library of Python, `gh` and `git`. The tests check every GraphQL request against GitHub's schema, [dry runs](https://github.com/Dennis-Otto/issue-assistant/blob/main/docs/architecture/dry-runs.md) run the path of an issue through the AI and each reusable workflow as a repository calls them.
 
 ## License
 

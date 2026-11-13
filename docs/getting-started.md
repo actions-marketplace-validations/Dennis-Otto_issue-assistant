@@ -48,7 +48,7 @@ A set-up has three parts: what `install` writes, what you edit, and what you set
 
     **[Turn on updates](getting-started.md#turn-on-updates)** by Dependabot or Renovate, if neither looks after the repository yet.
 
-4. **Try it:** commit the set-up, push it to the default branch, and under *Actions → Issue assistant → Run workflow*, enter the number of an existing issue. A run by hand starts as a dry run, which writes nothing; the summary of its `apply` job shows the labels and the comment that it would post:
+4. **Try it:** commit the set-up, push it to the default branch, and under *Actions → Issue assistant → Run workflow*, enter the number of an issue. A run by hand starts as a dry run, which writes nothing; the summary of the job *Check and post the analysis* (`apply`) shows the labels and the comment it would post:
 
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Dennis-Otto/issue-assistant/main/docs/images/dry-run-dark.webp">
@@ -68,7 +68,7 @@ On Windows, run the commands in Git Bash; Python's launcher `py` takes the place
 | `.github/egress-firewall.yaml` | when missing | add the hosts that the engine needs besides those of the template, if any |
 | `.github/issue-assistant/project.md` | when missing | describe the project, as step 2 says |
 | `.github/labels.toml` | when missing | define the labels: the seven lifecycle labels are required; kinds, areas, topics and, if you add them, priorities are what the AI chooses from |
-| `.github/issue-assistant/config.toml` | when missing | choose the engine, the hosts that links may lead to, the field of the issue forms that chooses an area, the categories of the discussions that get a first answer, and the files that tell reporters which AI reads their issue |
+| `.github/issue-assistant/config.toml` | when missing | choose the engine, the hosts that links may lead to, the field of the issue forms that chooses an area, the categories of discussions that get a first answer, and the files that tell reporters which AI reads their issue |
 | `.github/findings.toml` | when missing | accept findings of code scanning that can't or shouldn't be fixed, each with its reason |
 | `.github/ISSUE_TEMPLATE/bug_report.yml`, `feature_request.yml` | together with the starter `labels.toml`, when the repository has no issue forms or templates | adapt the answers of the field *Area*, whose `form_options` in `labels.toml` choose an area label; their box *Automated analysis* lets a reporter [say no to the AI](features/opt-out.md) |
 | `.github/ISSUE_TEMPLATE/config.yml` | with these forms, when it is missing | turn on what its links need in the settings of the repository: Discussions, for the first category of `[discussions] answer_categories`, and private vulnerability reporting, which GitHub offers only for public repositories; remove a link that you don't want or that can't work |
@@ -108,11 +108,11 @@ The check runs on Linux, macOS or Windows, with Python 3.12 or newer, and reads 
 
 ### Without `--setup`
 
-`install` alone writes only files. Create the environment and the secret on GitHub yourself, under *Settings → Environments*, or with the GitHub CLI:
+`install` alone writes only files. Create the environment and its secret in *Settings → Environments* or with the GitHub CLI; `BRANCH` is the default branch:
 
 ```sh
 gh api -X PUT repos/OWNER/REPO/environments/issue-assistant -F "deployment_branch_policy[protected_branches]=false" -F "deployment_branch_policy[custom_branch_policies]=true"
-gh api -X POST repos/OWNER/REPO/environments/issue-assistant/deployment-branch-policies -f name=main -f type=branch
+gh api -X POST repos/OWNER/REPO/environments/issue-assistant/deployment-branch-policies -f name=BRANCH -f type=branch
 gh secret set CLAUDE_CODE_OAUTH_TOKEN --env issue-assistant --repo OWNER/REPO
 ```
 
@@ -143,7 +143,7 @@ The cooldown waits a week before a new release, as zizmor asks; security updates
 
 1. **The check passes** on your computer and in the CI of the repository, as *Keep it checked* above adds it. It names every problem of the labels, the issue forms, the workflows, the firewall policy and the settings, every key that it doesn't know, and a `project.md` that still holds the starter's first line or says less than 80 characters. [Troubleshooting](troubleshooting.md) has the fix for each.
 2. **The labels exist** once the set-up is merged into the default branch: the Labels workflow creates those of `.github/labels.toml`, and *Issues → Labels* lists them.
-3. **A dry run shows the comment**, as the last step of the set-up tries it: the summary of the `apply` job of a run by hand shows the labels and the comment that it would post, and writes nothing.
+3. **A dry run shows the comment**: the summary of the job *Check and post the analysis* (`apply`) shows the labels and the comment that it would post, and writes nothing.
 4. **A new issue gets its analysis** within a few minutes. Open it from an account that is not a maintainer's: issues of the owner, members and collaborators get the labels of their form, but no analysis.
 
 When no comment comes, [troubleshooting](troubleshooting.md) has the usual causes, each with its fix. [What reporters see](comments.md) shows every comment that the assistant posts.
@@ -155,7 +155,7 @@ Issues that were open before get a first analysis by the task [backlog](features
 <details markdown="1">
 <summary>Three steps, for a maintainer</summary>
 
-1. **See what it would do.** Under *Actions → Issue assistant → Run workflow*, choose the task `backlog` and enter `0` as the issue, or run `gh workflow run issue-assistant.yml -f mode=backlog -f issue=0`. As a dry run, it chooses the oldest open issues without a first analysis, up to `backlog_per_run` of `config.toml`, 20 by default; it runs the AI for each, so set it low for a first look. The summary of the job `apply` of each shows its labels, a possible duplicate and the missing information as a table.
+1. **See what it would do.** Under *Actions → Issue assistant → Run workflow*, choose the task `backlog` and enter `0` as the issue, or run `gh workflow run issue-assistant.yml -f mode=backlog -f issue=0`. As a dry run, it chooses the oldest open issues without a first analysis, up to `backlog_per_run` of `config.toml`, 20 by default; it runs the AI for each, so set it low for a first look. The summary of the job *Check and post the analysis* (`apply`) of each shows its labels, a possible duplicate and the missing information as a table.
 2. **Set the labels.** Run it again from the same number with *dry_run* off. It sets the labels of each analysis and posts no comment on the old issues, unless you tick *comment*.
 3. **Go on.** The summary of the job `assistant` names the last issue that it chose: enter that number as the issue of the next run, until it says that the backlog is done.
 
@@ -170,3 +170,33 @@ The footer of every comment of the AI already links the issue assistant, unless 
 ```markdown
 [![issues: triaged by issue assistant](https://img.shields.io/badge/issues-triaged%20by%20issue%20assistant-blue)](https://dennis-otto.github.io/issue-assistant/)
 ```
+
+## Remove the assistant
+
+<details markdown="1">
+<summary>Five steps, for a maintainer</summary>
+
+Setting `ISSUE_ASSISTANT_AI` to `off` only turns the AI off, as [the FAQ](faq.md#how-do-i-turn-it-off) says. To remove the assistant from a repository, undo what the set-up did, in this order:
+
+1. **Delete the workflows and the files that `install` wrote,** in one pull request: the five workflows in `.github/workflows/`, `issue-assistant.yml`, `issue-lifecycle.yml`, `labels.yml`, `findings.yml` and `discussion-assistant.yml`, which answers discussions with the engine too; the settings in `.github/issue-assistant/`, `.github/labels.toml`, `.github/findings.toml` and the firewall policy `.github/egress-firewall.yaml`; and the step of the check that [Keep it checked](#keep-it-checked) added to the CI, which would fail without them. `discussion-assistant.yml`, `.github/findings.toml` and the firewall policy exist only where the set-up wrote them, so the command skips what is missing. Once it is merged, nothing of the assistant runs any more.
+
+    ```sh
+    git rm -r --ignore-unmatch .github/workflows/issue-assistant.yml .github/workflows/issue-lifecycle.yml \
+      .github/workflows/labels.yml .github/workflows/findings.yml \
+      .github/workflows/discussion-assistant.yml .github/issue-assistant \
+      .github/labels.toml .github/findings.toml .github/egress-firewall.yaml
+    ```
+
+2. **Delete the environment `issue-assistant`,** with the engine's secret in it, and the repository variables `ISSUE_ASSISTANT_AI` and `ISSUE_ASSISTANT_AI_RUNNER`, where you set them, under *Settings → Environments* and *Settings → Secrets and variables → Actions*, or with the GitHub CLI:
+
+    ```sh
+    gh api -X DELETE repos/OWNER/REPO/environments/issue-assistant
+    gh variable delete ISSUE_ASSISTANT_AI
+    gh variable delete ISSUE_ASSISTANT_AI_RUNNER
+    ```
+
+3. **Settle the issues that the assistant looked after.** Close the issue of the [digest](features/digest.md#the-digest-as-an-issue), if the sweep kept one. Nothing reminds the reporters of the open issues labeled `needs-info` any more, or closes those labeled `fixed-in-next-release` with the release: `gh issue list --label needs-info` and `gh issue list --label fixed-in-next-release` list them, for you to answer, close or relabel. The labels themselves stay, since the Labels workflow never deletes one; delete those you no longer want under *Issues → Labels*.
+4. **Let merged pull requests close their issues again:** under *Settings → General → Issues*, tick **Auto-close issues with merged linked pull requests**, which step 3 of [the set-up](#set-up-a-repository) cleared.
+5. **Stop telling reporters about the AI:** remove the section *What happens with your issue* from `SUPPORT.md`, or from the files of `[transparency]`, and the box *Automated analysis* from the issue forms, which nothing reads any more. The entry `/.issue-assistant/` of `.gitignore` can go as well. These are files, so they can go into the pull request of step 1.
+
+</details>

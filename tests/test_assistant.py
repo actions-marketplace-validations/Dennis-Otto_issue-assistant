@@ -20,7 +20,7 @@ import pytest
 from markdown_it import MarkdownIt
 
 import issue_assistant as assistant
-from oracle import problems
+from oracle import headings, problems
 from support import (
     BOT_USER,
     BOX,
@@ -3844,6 +3844,35 @@ def test_mentions_images_html_and_headings_are_removed(config):
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "cleaned"),
+    [
+        # A line of = or - below text makes it a heading: it is escaped.
+        ("Title\n===\n\nSub\n---", "Title\n\\===\n\nSub\n\\---"),
+        ("> Title\n> ===\n\n- Item\n  ---", "> Title\n> \\===\n\n- Item\n  \\---"),
+        # Below code too, which may go on from the line of text above it.
+        ("Run `make`\n---", "Run `make`\n\\---"),
+        # Below a blank line, a rule stays a rule.
+        ("Text\n\n---\n\nMore", "Text\n\n---\n\nMore"),
+        # The marks of a heading go in a quote and in a list item too, which keep
+        # their own marks. A quote needs no space after its mark.
+        ("> # Title\n\n- ## Item\n\n1. # One", "> Title\n\n- Item\n\n1. One"),
+        (">## Title", "> Title"),
+        # Deeper in a list, more indentation can still make a heading: there the
+        # marks are escaped, and in code, as after five spaces, that only shows a
+        # backslash.
+        ("- a\n    - # x", "- a\n    - \\# x"),
+        ("- a\n  - b\n      - # x", "- a\n  - b\n      - \\# x"),
+        ("10. a\n\n    # x", "10. a\n\n    \\# x"),
+        ("-     # code", "-     \\# code"),
+    ],
+)
+def test_no_heading_of_any_kind_is_left(config, text, cleaned):
+    output = assistant.sanitize(text, config)
+    assert output == cleaned
+    assert headings(output) == []
+
+
 def test_only_links_to_known_places_stay_links(config):
     text = (
         "[docs](https://github.com/owner/project/blob/main/README.md), "
@@ -4762,6 +4791,96 @@ def test_the_footer_links_the_first_notice_to_reporters(
     # Without the credit, the footer ends with what it asks.
     settings = dataclasses.replace(settings, credit=False)
     assert assistant.invitation("en", settings) == expected
+
+
+def test_the_anchors_of_the_notice_are_those_of_its_templates():
+    # install writes the notices from these templates, in English and in German.
+    for language, anchor in [("en", assistant.NOTICE_ANCHOR)] + sorted(
+        assistant.NOTICE_ANCHORS.items()
+    ):
+        suffix = "" if language == "en" else f".{language}"
+        template = assistant.TEMPLATES / f"SUPPORT-notice{suffix}.md"
+        assert next(iter(assistant.headings(template))) == anchor
+
+
+GERMAN_NOTICE = "## Was mit deinem Issue geschieht\n\nClaude von Anthropic liest.\n"
+
+
+@pytest.mark.parametrize(
+    ("notices", "german", "language", "link"),
+    [
+        # A German comment links the German notice, at its German heading, as
+        # homedarts-for-autodarts lists docs/troubleshooting.de.md.
+        (
+            ("SUPPORT.md", "docs/SUPPORT.de.md"),
+            GERMAN_NOTICE,
+            "de",
+            f"{NOTICE.removesuffix('SUPPORT.md')}docs/SUPPORT.de.md"
+            "#was-mit-deinem-issue-geschieht",
+        ),
+        # A German notice with the English heading still links that part.
+        (
+            ("SUPPORT.md", "./docs/SUPPORT.DE.md"),
+            "## What happens with your issue\n",
+            "de",
+            f"{NOTICE.removesuffix('SUPPORT.md')}docs/SUPPORT.DE.md"
+            "#what-happens-with-your-issue",
+        ),
+        # One without that part: the whole file.
+        (
+            ("SUPPORT.md", "docs/SUPPORT.de.md"),
+            "# Hilfe\n",
+            "de",
+            f"{NOTICE.removesuffix('SUPPORT.md')}docs/SUPPORT.de.md",
+        ),
+        # An English comment, or one in a language without a notice, links the first
+        # file, as does a German one whose notice is missing or outside the repository.
+        (
+            ("SUPPORT.md", "docs/SUPPORT.de.md"),
+            GERMAN_NOTICE,
+            "en",
+            f"{NOTICE}#what-happens-with-your-issue",
+        ),
+        (
+            ("SUPPORT.md", "docs/SUPPORT.de.md"),
+            GERMAN_NOTICE,
+            "fr",
+            f"{NOTICE}#what-happens-with-your-issue",
+        ),
+        (
+            ("SUPPORT.md", "docs/missing.de.md", "../SUPPORT.de.md"),
+            None,
+            "de",
+            f"{NOTICE}#what-happens-with-your-issue",
+        ),
+        # A notice that isn't Markdown: the whole file.
+        (
+            ("docs/SUPPORT.txt",),
+            GERMAN_NOTICE,
+            "de",
+            f"{NOTICE.removesuffix('SUPPORT.md')}docs/SUPPORT.txt",
+        ),
+        # Without the first file, which check reports, the German one still helps.
+        (
+            ("docs/missing.md", "docs/SUPPORT.de.md"),
+            GERMAN_NOTICE,
+            "de",
+            f"{NOTICE.removesuffix('SUPPORT.md')}docs/SUPPORT.de.md"
+            "#was-mit-deinem-issue-geschieht",
+        ),
+    ],
+)
+def test_a_comment_links_the_notice_in_its_language(
+    config, root, notices, german, language, link
+):
+    if german is not None:
+        (root / "docs").mkdir(exist_ok=True)
+        (root / notices[-1].removeprefix("./")).write_text(german, encoding="utf-8")
+    settings = dataclasses.replace(config, notices=notices)
+    assert assistant.notice_link(settings, language) == link
+    assert link in assistant.invitation(language, settings)
+    duplicate = assistant.render_duplicate(7, "maintainer", language, settings)
+    assert f"]({link})" in duplicate
 
 
 @pytest.mark.parametrize("path", sorted(LOCALES.glob("*.toml")), ids=lambda p: p.stem)
@@ -8134,6 +8253,78 @@ def test_a_merged_fix_marks_the_issue_until_the_release(config):
     assert assistant.sweep(github, NOW) == []
 
 
+def test_a_feature_request_hears_what_was_implemented_not_fixed(config):
+    """A feature request had no problem to fix: the notice of the merge says what
+    a pull request implemented, under the same marker, which the sweeps and the
+    digest read for either kind."""
+    github = merged(config, labels=("enhancement", "needs-triage"))
+    assert assistant.sweep(github, NOW) == [
+        "#12: fixed by #40; closes with the next release."
+    ]
+    (notice,) = github.posted(12)
+    assert notice == (
+        "<!-- issue-assistant:fixed pull=40 -->\n"
+        "Implemented by #40, which is now on `main`. It ships with the next "
+        "release; this issue closes then, with a link to it.\n"
+    )
+    assert assistant.sweep(github, NOW) == []
+
+
+@pytest.mark.parametrize("muted", [False, True])
+def test_the_release_tells_a_feature_request_how_to_use_it(config, muted):
+    github = released(config)
+    kinds = ["enhancement", "fixed-in-next-release"] + ["assistant-muted"] * muted
+    github.store[12]["labels"] = [{"name": name} for name in kinds]
+    assert assistant.close_released(github) == ["#12: closed, released in v1.10.0."]
+    (comment,) = github.posted(12)
+    assert comment.startswith("<!-- issue-assistant:released tag=v1.10.0 -->\n")
+    where = "for the maintainers," if muted else "within 30 days and the issue reopens,"
+    assert comment.endswith(
+        "v1.10.0) with #40. @reporter, update to this version to use it. If something "
+        f"is missing, write a comment here {where} or open a new issue.\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("labels", "issue_type", "feature"),
+    [
+        (("enhancement",), None, True),
+        (("enhancement", "needs-triage"), {"name": "Task"}, True),
+        ((), {"name": "Feature"}, True),
+        (("bug", "enhancement"), None, False),
+        (("bug",), {"name": "Feature"}, False),
+        (("documentation",), None, False),
+        ((), None, False),
+        ((), {"name": "Task"}, False),
+    ],
+)
+def test_only_a_request_for_a_feature_without_the_kind_of_a_bug_is_one(
+    labels, issue_type, feature
+):
+    """The words of a fix stay the default: they fit a bug, a gap in the
+    documentation or an issue without a kind; the label `bug` wins over the rest."""
+    issue = make_issue(labels=labels, type=issue_type)
+    assert assistant.requests_a_feature(issue) is feature
+
+
+@pytest.mark.parametrize("language", assistant.LANGUAGES)
+def test_every_language_tells_a_feature_request_other_words(language):
+    release = make_release()
+    for muted in (False, True):
+        problem = assistant.render_released(
+            "reporter", release, [40], language, muted=muted
+        )
+        feature = assistant.render_released(
+            "reporter", release, [40], language, muted=muted, feature=True
+        )
+        assert problem.split("\n")[0] == feature.split("\n")[0]
+        assert problem != feature and "#40" in feature
+    fixed = assistant.render_fixed(40, "main", language)
+    implemented = assistant.render_fixed(40, "main", language, feature=True)
+    assert fixed.split("\n")[0] == implemented.split("\n")[0]
+    assert fixed != implemented and "#40" in implemented and "`main`" in implemented
+
+
 def test_the_notice_of_a_fix_speaks_the_reporter_s_language(config):
     github = merged(config, labels=("bug",))
     german = assistant.render_marker("analysis", lang="de")
@@ -8263,6 +8454,29 @@ def test_a_busy_repository_marks_a_fix_on_a_later_page(config):
     # there is no third.
     pages = [call for call in github.calls if "pullRequests(states: MERGED" in call[1]]
     assert [call[2]["cursor"] for call in pages] == [None, "100"]
+
+
+def test_a_fix_of_eleven_issues_marks_the_eleventh(config):
+    github = merged(config, make_pull(fixes=range(12, 23)), labels=("bug",))
+    for number in range(13, 23):
+        github.store[number] = make_issue(number, labels=("bug",))
+    assert assistant.mark_fixed(github, NOW) == [
+        f"#{number}: fixed by #40; closes with the next release."
+        for number in range(12, 23)
+    ]
+    assert github.labels_of(22) == {"bug", "fixed-in-next-release"}
+
+
+def test_a_fix_of_more_issues_than_one_page_names_the_rest(config, capsys):
+    # A hundred closed ones come first, which cost no request, and #12 after them.
+    pull = make_pull(fixes=(*range(1000, 1100), 12))
+    for reference in pull["closingIssuesReferences"]["nodes"][:100]:
+        reference["state"] = "CLOSED"
+    github = merged(config, pull, labels=("bug",))
+    skipped = "#40 fixes 101 issues; the 1 after the first 100 get no label."
+    assert assistant.mark_fixed(github, NOW) == [skipped]
+    assert f"::notice::{skipped}" in capsys.readouterr().out
+    assert github.labels_of(12) == {"bug"}
 
 
 def test_a_fix_that_a_release_already_ships_closes_the_issue_at_once(config):
@@ -8504,6 +8718,29 @@ def test_a_release_without_the_fix_keeps_the_issue_open(config):
     github = released(config, contained=False)
     assert assistant.close_released(github) == []
     assert github.store[12]["state"] == "open"
+
+
+def test_the_release_waits_for_the_eleventh_fix_of_an_issue(config):
+    github = released(
+        config,
+        pulls=[make_pull(30 + index, days_ago=3) for index in range(11)],
+        contained=False,
+    )
+    # The release ships the first ten fixes, but not the eleventh.
+    github.contained = {(f"{30 + index:040x}", "v1.10.0") for index in range(10)}
+    assert assistant.close_released(github) == []
+    assert github.store[12]["state"] == "open"
+
+
+def test_more_fixes_of_an_issue_than_one_page_are_named(config, capsys):
+    pulls = [make_pull(100 + index, days_ago=3) for index in range(101)]
+    github = released(config, pulls=pulls, contained=False)
+    github.contained = {(f"{100 + index:040x}", "v1.10.0") for index in range(101)}
+    assert assistant.close_released(github) == ["#12: closed, released in v1.10.0."]
+    assert (
+        "::notice::#12: 101 pull requests name it; the release waits only for the"
+        " fixes of the first 100, not for the other 1." in capsys.readouterr().out
+    )
 
 
 def test_the_first_release_with_every_fix_closes_the_issue(config):

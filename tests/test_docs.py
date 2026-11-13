@@ -5,7 +5,9 @@ import dataclasses
 import importlib.util
 import inspect
 import json
+import posixpath
 import re
+import subprocess
 import sys
 import textwrap
 import tomllib
@@ -27,7 +29,11 @@ IMAGES = ROOT / "docs" / "images"
 # checks the pictures of the diagrams in docs/images/diagrams.
 SCREENSHOTS = sorted(path for path in IMAGES.iterdir() if path.name != "diagrams")
 RAW = "https://raw.githubusercontent.com/Dennis-Otto/issue-assistant/main/"
-DOCUMENTS = [ROOT / "README.md", *sorted((ROOT / "docs").rglob("*.md"))]
+DOCUMENTS = [
+    ROOT / "README.md",
+    ROOT / "README.de.md",
+    *sorted((ROOT / "docs").rglob("*.md")),
+]
 PICTURE = (
     "<picture>\n"
     '  <source media="(prefers-color-scheme: dark)" srcset="{dark}">\n'
@@ -180,13 +186,50 @@ def test_every_page_that_the_documentation_links_on_main_exists():
         for match in re.finditer(
             r"https://(github\.com/Dennis-Otto/issue-assistant/blob|"
             r"raw\.githubusercontent\.com/Dennis-Otto/issue-assistant)/main/"
-            r"(docs/[^#?\")\s]+\.md)",
+            r"(docs/[^#?\")\s]+\.md|README\.de\.md)",
             document.read_text("utf-8"),
         )
     ]
     assert ("README.md", "docs/comparison.md") in linked
+    assert ("README.md", "README.de.md") in linked
     for name, path in linked:
         assert (ROOT / path).is_file(), f"{name} links {path}, which doesn't exist"
+
+
+def website_page(source: Path) -> str:
+    # docs/faq.md is faq.html and docs/faq.de.md de/faq.html, as the site builds them.
+    page = source.relative_to(ROOT / "docs").with_suffix("").as_posix()
+    if page.endswith(".de"):
+        return f"de/{page.removesuffix('.de')}.html"
+    return f"{page}.html"
+
+
+@pytest.mark.mutation_unsafe
+def test_every_address_of_the_website_names_a_page_that_it_has():
+    # The website is built with use_directory_urls: false, so a page is
+    # troubleshooting.html, and troubleshooting/ is a 404. The workflows name these
+    # addresses in their errors, the templates and the code in what they post.
+    site = "https://dennis-otto.github.io/issue-assistant/"
+    texts = [
+        path
+        for folder in (".github", "docs", "issue_assistant", "locales", "templates")
+        for path in (ROOT / folder).rglob("*")
+        if path.suffix in {".md", ".py", ".toml", ".yml", ".yaml", ".json"}
+    ]
+    texts += [ROOT / "README.md", ROOT / "README.de.md", ROOT / "action.yml"]
+    linked = {
+        (path.relative_to(ROOT).as_posix(), match[1].rstrip(".,:;"))
+        for path in texts
+        for match in re.finditer(
+            rf"{re.escape(site)}([^\s\"'`)<>#?*]*)", path.read_text("utf-8")
+        )
+    }
+    assert ("README.de.md", "de/") in linked
+    pages = {website_page(source) for source in (ROOT / "docs").rglob("*.md")}
+    # The start pages answer at their folder as well.
+    pages |= {"", "de/"}
+    for name, page in sorted(linked):
+        assert page in pages, f"{name} links {site}{page}, which the website lacks"
 
 
 def test_the_readme_links_only_full_addresses():
@@ -483,6 +526,35 @@ def test_a_missing_picture_fails_the_build(docs: Path):
         hooks.localized(html, "index.html", docs)
 
 
+def test_a_page_in_german_shows_the_pictures_of_docs(docs: Path):
+    # The i18n plugin serves in de/ only the pictures in German, NAME.de.png as
+    # de/images/NAME.png; a page in de/ shows the others from images/ of the default
+    # language, which the build of the website found missing in de/images/ before.
+    (docs / "images" / "a-dark.de.png").write_bytes(png(800, 450))
+    html = PICTURE.format(dark="images/a-dark.png", light="images/a-light.png")
+    shown = hooks.localized(html, "de/index.html", docs)
+    assert 'src="images/a-dark.png#only-dark"' in shown
+    assert 'src="../images/a-light.png#only-light"' in shown
+    assert 'width="1600" height="900"' in shown
+    assert 'width="800" height="450"' in shown
+    # So does the English page that the plugin shows in de/ when it has no German one.
+    deeper = html.replace('"images/', '"../images/')
+    fallback = hooks.localized(deeper, "de/features/index.html", docs)
+    assert 'src="../../images/a-light.png#only-light"' in fallback
+    assert 'src="../images/a-dark.png#only-dark"' in fallback
+    # The pages of the default language, and addresses elsewhere, stay as they are.
+    other = '<img src="https://example.com/a.png"><img src="/images/a.png">'
+    assert hooks.localized(other, "de/index.html", docs) == other
+    assert 'src="images/a-light.png#only-light"' in hooks.localized(
+        html, "index.html", docs
+    )
+    # A folder of pages that is no language finds nothing there.
+    with pytest.raises(FileNotFoundError):
+        hooks.localized(html, "features/index.html", docs)
+    with pytest.raises(FileNotFoundError):
+        hooks.localized(html.replace("a-", "c-"), "de/index.html", docs)
+
+
 def test_a_source_that_the_hook_cannot_read_fails_the_build(docs: Path):
     # Each would be lost in both copies of the picture.
     for source in (
@@ -629,11 +701,16 @@ def test_the_theme_of_the_system_applies_before_the_pictures_load():
 def test_the_hook_knows_every_picture_of_the_documentation():
     for document in DOCUMENTS:
         text = document.read_text("utf-8")
-        # The README, which no page includes, as the hook would treat it.
+        # The READMEs, which no page includes, as the hook would treat them, and a
+        # German page where the website shows it, in de/.
         url = (
             "guide.html"
-            if document.name == "README.md"
-            else document.relative_to(ROOT / "docs").with_suffix(".html").as_posix()
+            if document.parent == ROOT
+            else re.sub(
+                r"^(.+?)(\.de)?\.md$",
+                lambda page: ("de/" if page[2] else "") + f"{page[1]}.html",
+                document.relative_to(ROOT / "docs").as_posix(),
+            )
         )
         html = hooks.localized(text, url, ROOT / "docs")
         assert text.count("<picture>") == len(hooks.PICTURE.findall(text)), url
@@ -823,6 +900,7 @@ USERS = {
     "player-switch-for-autodarts",
     "paperless-unified-search",
     "paperless-sync",
+    "repo-pager",
     "repo-blueprint",
     "dennis-otto.github.io",
 }
@@ -890,9 +968,12 @@ def test_a_page_includes_only_a_part_of_another_page():
         ]
         assert not re.search(r'^--8<-- "README', text, re.M), page
     assert sorted(included) == [
+        ("index.de.md", "getting-started.de.md", "quick-start"),
         ("index.md", "getting-started.md", "quick-start"),
     ]
-    assert sorted(parts) == sorted((source, name) for _, source, name in included)
+    assert sorted(set(parts)) == sorted(
+        {(source, name) for _, source, name in included}
+    )
 
 
 BLOB = "https://github.com/Dennis-Otto/issue-assistant/blob/main/"
@@ -973,8 +1054,10 @@ def test_the_readme_and_the_set_up_offer_the_same_badge_that_leads_to_the_websit
 
 
 def test_the_readme_is_short_and_leads_to_every_feature():
+    # The German README is read on a phone just as much.
+    for name in ("README.md", "README.de.md"):
+        assert len((ROOT / name).read_bytes()) <= README_BYTES, name
     readme = (ROOT / "README.md").read_text("utf-8")
-    assert len(readme.encode("utf-8")) <= README_BYTES
     features = section_of_readme(readme, "What it does")
     for page in hooks.FEATURES:
         (line,) = [line for line in features.splitlines() if f"/docs/{page})" in line]
@@ -1065,6 +1148,8 @@ def phone_height(markdown: str) -> int:
     pictures = len(re.findall(r"<picture>", markdown))
     text = re.sub(r"<picture>.*?</picture>", "", markdown, flags=re.DOTALL)
     text = re.sub(r"<details.*?</details>", "", text, flags=re.DOTALL)
+    # The anchor of a heading of a German page, which shows nothing.
+    text = re.sub(r'^<a id="[^"]*"></a>$', "", text, flags=re.MULTILINE)
     text = re.sub(r"\]\([^)]*\)", "]", text)
     lines = sum(1 + len(line) // LINE for line in text.splitlines() if line.strip())
     return lines * LINE_HEIGHT + pictures * PICTURE_HEIGHT
@@ -1144,7 +1229,9 @@ def test_the_guide_has_a_page_for_each_topic():
     pages = set(menu().values())
     for path in (ROOT / "docs").rglob("*.md"):
         page = path.relative_to(ROOT / "docs").as_posix()
-        assert page in pages or re.fullmatch(r"decisions/\d{4}-[a-z0-9-]+\.md", page)
+        # A German page, such as faq.de.md, takes the place of its English twin.
+        twin = page.removesuffix(".de.md") + ".md" if page.endswith(".de.md") else page
+        assert twin in pages or re.fullmatch(r"decisions/\d{4}-[a-z0-9-]+\.md", page)
 
 
 def test_every_page_names_the_same_users():
@@ -1154,6 +1241,42 @@ def test_every_page_names_the_same_users():
     assert users(readme, "**Used by**") == USERS
     assert users(home, "**Used by**") == USERS
     assert users(roadmap, "- **The repositories that use it.**") == USERS
+    # The German README and home page name the same.
+    for german in (ROOT / "README.de.md", ROOT / "docs" / "index.de.md"):
+        assert users(german.read_text("utf-8"), "**Im Einsatz bei**") == USERS
+
+
+# The real analyses that the README and the home page show, each at the anchor of its
+# comment: a bug traced into the code, a feature request and an answer in the
+# reporter's language with a summary for the maintainer.
+LIVE = [
+    "https://github.com/Dennis-Otto/homedarts-for-autodarts/issues/521"
+    "#issuecomment-6547309975",
+    "https://github.com/Dennis-Otto/paperless-sync/issues/84#issuecomment-6125470710",
+    "https://github.com/Dennis-Otto/paperless-sync/issues/345#issuecomment-6582461804",
+]
+
+
+def live_examples(text: str, label: str) -> list[str]:
+    """The links of the sentence that starts with **<label>:**, in their order."""
+    (sentence,) = re.findall(rf"\*\*{label}:\*\* [^\n]*?\.(?= |$)", text, re.M)
+    return re.findall(r"\]\((https://[^)]+)\)", sentence)
+
+
+@pytest.mark.parametrize(
+    ("readme", "home", "label"),
+    [
+        ("README.md", "index.md", "See it live"),
+        ("README.de.md", "index.de.md", "Live ansehen"),
+    ],
+)
+def test_every_page_shows_the_same_live_examples(readme: str, home: str, label: str):
+    readme_text = (ROOT / readme).read_text("utf-8")
+    home_text = (ROOT / "docs" / home).read_text("utf-8")
+    assert live_examples(readme_text, label) == LIVE
+    assert live_examples(home_text, label) == LIVE
+    # The button of the home page leads to the bug, the example that shows the most.
+    assert f"[{label}]({LIVE[0]}){{ .md-button }}" in home_text
 
 
 def test_no_page_links_a_repository_by_its_old_name():
@@ -1483,7 +1606,10 @@ def test_the_comments_page_examples_carry_their_marker_and_language():
                 "secret": "analysis",
                 "personal": "analysis",
                 "security": "analysis",
+                "implemented": "fixed",
                 "released-muted": "released",
+                "released-feature": "released",
+                "released-feature-muted": "released",
                 "reopened-release": "reopened",
                 "discussion-bug": "discussion-answer",
                 "discussion-feature": "discussion-answer",
@@ -1617,7 +1743,7 @@ def test_the_comments_page_takes_its_timing_rules_from_the_assistant(monkeypatch
 def test_a_comment_looks_as_github_shows_it():
     text = (
         "<!-- issue-assistant:analysis lang=en questions=1 engine=claude -->\n\n"
-        "Thanks for the report, @alex-demo!\n\n"
+        "Thanks for the report, @alex_demo!\n\n"
         "> [!WARNING]\n> Remove the token.\n\n"
         "### Related\n\n- #17: The same, see `#3` and `@not-a-mention`.\n"
         "- [`chart.py`, line 52](https://github.com/demo-org/plant-monitor/blob/x/"
@@ -1637,13 +1763,13 @@ def test_a_comment_looks_as_github_shows_it():
     converted = hooks.comment_html(
         text,
         lambda markdown: (
-            '<p>Thanks, @alex-demo! <a href="https://github.com/demo-org/plant-monitor/'
+            '<p>Thanks, @alex_demo! <a href="https://github.com/demo-org/plant-monitor/'
             'blob/x/chart.py#L52"><code>chart.py</code>, line 52</a> and #17, '
             "<code>#3 @not-a-mention</code>, a@b.example, "
             '<a href="https://example.com/#9">#9</a>.</p>'
         ),
     )
-    assert '<span class="ia-mention">@alex-demo</span>' in converted
+    assert '<span class="ia-mention">@alex_demo</span>' in converted
     assert '<span class="ia-link"><code>chart.py</code>, line 52</span>' in converted
     assert '<span class="ia-link">#17</span>' in converted
     assert "<code>#3 @not-a-mention</code>" in converted
@@ -1683,10 +1809,10 @@ def test_the_comments_take_the_place_that_the_page_keeps_for_them():
     # The first comment shows, and the others fold, so that the page stays short.
     assert markdown.count('???+ note "The comment"') == 1
     assert markdown.count('??? note "The comment"') == len(hooks.examples()) - 1
-    assert "| `bug` | Thanks for the report, @alex-demo! |" in markdown
+    assert "| `bug` | Thanks for the report, @alex_demo! |" in markdown
     assert markdown.rstrip().endswith(
-        "| any other kind | Thanks for opening this issue, @alex-demo! | "
-        "Danke für dein Issue, @alex-demo! |"
+        "| any other kind | Thanks for opening this issue, @alex_demo! | "
+        "Danke für dein Issue, @alex_demo! |"
     )
     # The HTML of the page gets the HTML of each comment for its placeholder.
     key = hooks.placeholder("fixed", "de")
@@ -1708,6 +1834,26 @@ def test_the_markdown_of_a_comment_becomes_the_html_that_github_shows():
     assert "<h3>Summary</h3>" in html and "<h1>" not in html
     assert '<li><span class="ia-link">#17</span>: The same symptom' in html
     assert "<sub>🤖 Automated first analysis by Claude" in html
+
+
+def test_the_examples_link_no_repository_and_name_no_account_of_the_demo():
+    """The demo project and its related firmware exist nowhere, so no link of the page
+    leads to them, which would answer 404; and its people have names that GitHub
+    can't register, with an underscore, so that the page names no one's account."""
+    login = re.compile(r"[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}")
+    for name in (hooks.REPORTER, hooks.MAINTAINER):
+        assert not login.fullmatch(name), name
+    for example in hooks.examples():
+        for text in example.texts.values():
+            html = hooks.comment_html(text, hooks.markdown_html)
+            assert 'href="https://github.com/demo-org/' not in html, example.kind
+            names = re.findall(r'<span class="ia-mention">@([^<]*)</span>', html)
+            assert set(names) <= {hooks.REPORTER, hooks.MAINTAINER}, example.kind
+    (elsewhere,) = [
+        example for example in hooks.examples() if example.kind == "elsewhere"
+    ]
+    html = hooks.comment_html(elsewhere.texts["en"], hooks.markdown_html)
+    assert f'<span class="ia-link">{hooks.FIRMWARE}#31</span>' in html
 
 
 def test_every_input_and_output_of_the_action_is_in_the_reference():
@@ -2249,6 +2395,30 @@ def test_the_website_wears_the_brand():
     assert all((ROOT / "docs" / sheet).is_file() for sheet in website["extra_css"])
 
 
+def test_the_social_preview_names_the_project_as_the_readme_does():
+    name = (ROOT / "README.md").read_text("utf-8").split("\n", 1)[0].removeprefix("# ")
+    website = yaml.safe_load((ROOT / "mkdocs.yml").read_text("utf-8"))
+    assert name == website["site_name"] == "Issue assistant"
+    preview = (ROOT / ".github" / "social-preview.html").read_text("utf-8")
+    assert f"<title>{name}: social preview</title>" in preview
+    assert f"<h1>{name}</h1>" in preview
+
+
+@pytest.mark.parametrize("page", ["getting-started.md", "getting-started.de.md"])
+def test_the_environment_by_hand_lets_the_default_branch_use_it(page):
+    # As install --setup does, whatever the branch is called, such as master or
+    # develop: with main written in, the runs of another one may not use it.
+    text = (ROOT / "docs" / page).read_text("utf-8")
+    (policy,) = re.findall(r"^gh api .*/deployment-branch-policies .*$", text, re.M)
+    assert policy.endswith(" -f name=BRANCH -f type=branch")
+    explained = re.search(
+        r"^`install` .*; `BRANCH` (is the default branch|ist der Standard-Branch):$",
+        text,
+        re.M,
+    )
+    assert explained and explained.end() < text.index(policy)
+
+
 def test_the_hidden_copy_of_a_picture_has_no_link():
     # The hook puts a copy of a picture on the page for each theme, and the theme
     # hides the other one; the link of the lightbox around it goes with it, so that
@@ -2284,3 +2454,174 @@ def test_the_page_of_the_engines_says_which_limits_each_stops_at():
     for key, engine in assistant.ENGINES.items():
         named = " and ".join(f"`{stop}`" for stop in engine.stops_at)
         assert rows[key] == (named or "the time of the job"), key
+
+
+# The jobs of the reusable workflows, as the Actions tab shows them.
+WORKFLOWS_OF_JOBS = {
+    "Issue assistant": "reusable-issue-assistant.yml",
+    "Discussion assistant": "reusable-discussion-assistant.yml",
+    "Issue lifecycle": "reusable-issue-lifecycle.yml",
+    "Labels": "reusable-labels.yml",
+    "Findings": "reusable-findings.yml",
+}
+
+
+def shown_jobs() -> set[tuple[str, str, str]]:
+    """The workflow, the id and the name that GitHub shows of each job of the
+    reusable workflows that a repository calls."""
+    return {
+        (workflow, job, settings["name"])
+        for workflow, file in WORKFLOWS_OF_JOBS.items()
+        for job, settings in yaml.safe_load(
+            (ROOT / ".github" / "workflows" / file).read_text("utf-8")
+        )["jobs"].items()
+    }
+
+
+def test_the_troubleshooting_maps_the_id_of_each_job_to_the_name_that_github_shows():
+    # A renamed job of a reusable workflow fails here until its row follows.
+    table = section("troubleshooting.md", "The jobs of a run")
+    rows = re.findall(r"^\| ([^|`*]+?) \| `([a-z-]+)` \| \*([^*]+)\* \|", table, re.M)
+    assert set(rows) == shown_jobs()
+    assert len(rows) == len(shown_jobs())
+
+
+def test_every_page_names_a_job_beside_its_id_as_github_shows_it():
+    names: dict[str, set[str]] = {}
+    for _, job, name in shown_jobs():
+        names.setdefault(job, set()).add(name)
+    named = 0
+    for path in DOCUMENTS:
+        text = path.read_text("utf-8")
+        for name, job in re.findall(r"\*([^*\n]+)\* \(`([a-z-]+)`\)", text):
+            if job in names:
+                named += 1
+                assert name in names[job], (path.name, name, job)
+    assert named
+    # Where a newcomer looks for the job of a dry run first: its last step and the
+    # check that it works.
+    shown = "the job *Check and post the analysis* (`apply`)"
+    assert shown in section("getting-started.md", "Set up a repository")
+    assert shown in section("getting-started.md", "Check that it works")
+
+
+def test_the_troubleshooting_quotes_the_warnings_of_a_run_that_stopped_at_a_limit(
+    tmp_path, capsys
+):
+    run = assistant.Run(model="claude-opus-5-5", turns=40, budget="1", effort="")
+    warnings = []
+    for subtype in ("error_max_turns", "error_max_budget_usd"):
+        execution = tmp_path / f"{subtype}.json"
+        execution.write_text(
+            json.dumps([{"type": "result", "subtype": subtype, "is_error": True}]),
+            "utf-8",
+        )
+        assistant.report_usage(str(execution), run, "triage")
+        warnings.append(capsys.readouterr().out.removeprefix("::warning::"))
+    gemini = assistant.ENGINES["gemini"]
+    assert gemini.cli and gemini.cli.at_turns is not None
+    stopped = subprocess.CompletedProcess([], gemini.cli.at_turns, "", "")
+    with pytest.raises(assistant.AssistantError) as refused:
+        assistant.cli_answer(gemini, gemini.cli, stopped)
+    warnings.append(str(refused.value))
+    (row,) = [
+        line
+        for line in section("troubleshooting.md", "Symptoms").splitlines()
+        if "max_budget_usd" in line.split(" | ")[0]
+    ]
+    quoted = re.findall(r"\*([^*]+)\*", row.split(" | ")[0])
+    patterns = [
+        re.compile(".+?".join(map(re.escape, quote.split("…")))) for quote in quoted
+    ]
+    # Each quote is in a warning, and each warning has its quote.
+    assert all(any(p.search(w) for w in warnings) for p in patterns), quoted
+    assert all(any(p.search(w) for p in patterns) for w in warnings), warnings
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        "`authentication_error`",
+        "`rate_limit_error`",
+        "`not_found_error`",
+        "*The engine stopped at max_budget_usd*",
+    ],
+)
+def test_each_way_an_engine_gives_no_answer_has_a_row_that_leads_to_a_run_by_hand(
+    words,
+):
+    (row,) = [
+        line
+        for line in section("troubleshooting.md", "Symptoms").splitlines()
+        if words in line.split(" | ")[0]
+    ]
+    assert "(features/runs-by-hand.md)" in row and "task `triage`" in row, words
+
+
+# The German pages: what a newcomer reads first, beside its English twin.
+GERMAN_PAGES = ("index", "getting-started", "faq", "comments")
+GERMAN = ["README.de.md", *(f"docs/{page}.de.md" for page in GERMAN_PAGES)]
+
+
+def twin(german: str) -> str:
+    """The English page of a German one, such as docs/faq.md for docs/faq.de.md, and
+    an English page itself."""
+    return re.sub(r"\.de\.md$", ".md", german)
+
+
+def outline(text: str) -> dict[str, list[str]]:
+    """What a German page keeps of its English twin: the levels of its headings, its
+    pictures, with a German diagram for each English one, its blocks of code, and
+    the parts it includes, from the German page where there is one."""
+    pictures = re.findall(r'(?:src|srcset)="([^"]+)"', text)
+    return {
+        "headings": re.findall(r"^(#{1,6}) ", text, re.MULTILINE),
+        "pictures": [re.sub(r"\.de((?:\.dark)?\.svg)$", r"\1", p) for p in pictures],
+        "code": re.findall(r"^ *```\w*\n(.*?)^ *```$", text, re.M | re.S),
+        "includes": [
+            twin(source)
+            for source in re.findall(r'^--8<-- "([^":]+)', text, re.MULTILINE)
+        ],
+    }
+
+
+@pytest.mark.parametrize("german", GERMAN)
+def test_each_german_page_follows_its_english_twin(german: str):
+    text = (ROOT / german).read_text("utf-8")
+    english = (ROOT / twin(german)).read_text("utf-8")
+    assert outline(text) == outline(english)
+    # Each diagram is the German one, from its source of its own.
+    for picture in re.findall(r'(?:src|srcset)="([^"]*/diagrams/[^"]+)"', text):
+        name = re.sub(r"\.de(?:\.dark)?\.svg$", "", posixpath.basename(picture))
+        assert picture.endswith((".de.svg", ".de.dark.svg")), (german, picture)
+        assert (ROOT / "docs" / "diagrams" / f"{name}.de.mmd").is_file(), name
+    # It includes the German part of a page that has one.
+    for source in re.findall(r'^--8<-- "([^"]+):', text, re.MULTILINE):
+        assert source.endswith(".de.md"), (german, source)
+    if german.startswith("docs/"):
+        # A link of an English page to a heading leads to the German one too.
+        ids = re.findall(r'^<a id="([^"]+)"></a>\n\n#', text, re.MULTILINE)
+        assert ids == [
+            hooks_slug(heading)
+            for heading in re.findall(r"^#{1,6} (.+)$", english, re.MULTILINE)
+        ]
+
+
+def hooks_slug(heading: str) -> str:
+    """The anchor that the website gives an English heading."""
+    (slug,) = slugs(f"# {heading}")
+    return slug
+
+
+def test_the_readmes_lead_to_each_other_and_the_website_has_both_languages():
+    english = (ROOT / "README.md").read_text("utf-8")
+    german = (ROOT / "README.de.md").read_text("utf-8")
+    assert f"]({BLOB}README.de.md)" in english.split("\n- **", 1)[0]
+    assert f"]({BLOB}README.md)" in german.split("\n- **", 1)[0]
+    site = yaml.safe_load((ROOT / "mkdocs.yml").read_text("utf-8"))
+    languages = site["plugins"]["i18n"]["languages"]
+    assert [language["locale"] for language in languages] == ["en", "de"]
+    assert all(language["build"] for language in languages)
+    # Every German page of the website is one of those a newcomer reads first.
+    pages = sorted(path.name for path in (ROOT / "docs").rglob("*.de.md"))
+    assert pages == sorted(f"{page}.de.md" for page in GERMAN_PAGES)

@@ -133,9 +133,10 @@ def pull(
 
 
 FIXES = {
+    "totalCount": 1,
     "nodes": [
         {"number": 12, "state": "OPEN", "repository": {"nameWithOwner": REPOSITORY}}
-    ]
+    ],
 }
 DISCUSSION = {
     "number": 3,
@@ -153,6 +154,21 @@ DISCUSSION = {
 # A discussion with its comments and their replies, as GitHub holds it: a deleted
 # account is no author, and Actor is an interface, whose type GitHub answers.
 ASKER = {"__typename": "User", "login": "asker"}
+# The assistant's first answer and the asker's reply, as open_questions() gives them.
+FIRST_ANSWER_THREAD = {
+    "user": {"login": "github-actions[bot]", "type": "Bot"},
+    "author_association": "NONE",
+    "created_at": "2026-10-07T11:30:00Z",
+    "body": None,
+    "replies": [
+        {
+            "user": {"login": "asker", "type": "User"},
+            "author_association": "NONE",
+            "created_at": "2026-10-08T09:00:00Z",
+            "body": None,
+        }
+    ],
+}
 THREAD = {
     "id": "D_kwDOMpLSs84AdQ1x",
     "number": 5,
@@ -349,12 +365,13 @@ REQUESTS = {
                 "defaultBranchRef": {"name": "main"},
                 "issue": {
                     "closedByPullRequestsReferences": {
+                        "totalCount": 4,
                         "nodes": [
                             pull(31),
                             pull(32, merged=False),
                             pull(33, base="release"),
                             pull(34, repository="someone/else"),
-                        ]
+                        ],
                     }
                 },
             }
@@ -516,6 +533,109 @@ REQUESTS = {
                 "author_association": "NONE",
                 "created_at": "2026-10-07T11:00:00Z",
                 "body": None,
+            }
+        ],
+    ),
+    "the open questions with their last words": Request(
+        lambda github: github.open_questions(),
+        {
+            "repository": {
+                "discussions": {
+                    "pageInfo": PAGE,
+                    "nodes": [
+                        {
+                            **THREAD,
+                            "comments": {
+                                "nodes": [
+                                    {
+                                        "createdAt": "2026-10-07T11:30:00Z",
+                                        "authorAssociation": "NONE",
+                                        "author": {
+                                            "__typename": "Bot",
+                                            "login": "github-actions",
+                                        },
+                                        "replies": {
+                                            "nodes": [
+                                                {
+                                                    "createdAt": "2026-10-08T09:00:00Z",
+                                                    "authorAssociation": "NONE",
+                                                    "author": ASKER,
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            }
+        },
+        [
+            {
+                "number": 5,
+                "category": {"name": "Q&A"},
+                "answered": False,
+                "user": {"login": "asker", "type": "User"},
+                "author_association": "NONE",
+                "created_at": "2026-10-07T11:00:00Z",
+                "body": None,
+                # The only comment is the last one and the first one as well.
+                "comments": [FIRST_ANSWER_THREAD, FIRST_ANSWER_THREAD],
+            }
+        ],
+    ),
+    # The newest first; the second is older than the moment and ends the list.
+    "the first answers to the discussions since a moment": Request(
+        lambda github: github.questions_since(datetime(2026, 10, 6, 12, tzinfo=UTC)),
+        {
+            "repository": {
+                "discussions": {
+                    "pageInfo": PAGE,
+                    "nodes": [
+                        {
+                            **OF_THE_DAY[0],
+                            "comments": {
+                                "nodes": [
+                                    {
+                                        "body": "A first answer.",
+                                        "createdAt": "2026-10-07T11:05:00Z",
+                                        "authorAssociation": "NONE",
+                                        "isAnswer": True,
+                                        "author": {
+                                            "__typename": "Bot",
+                                            "login": "github-actions",
+                                        },
+                                        # The 👍 and the 👎, by the content asked.
+                                        "reactions": lambda _, content: {
+                                            "totalCount": {
+                                                "THUMBS_UP": 2,
+                                                "THUMBS_DOWN": 1,
+                                            }[content]
+                                        },
+                                    }
+                                ]
+                            },
+                        },
+                        {**OF_THE_DAY[1], "comments": {"nodes": []}},
+                    ],
+                }
+            }
+        },
+        [
+            {
+                "number": 9,
+                "created_at": "2026-10-07T11:00:00Z",
+                "comments": [
+                    {
+                        "user": {"login": "github-actions[bot]", "type": "Bot"},
+                        "author_association": "NONE",
+                        "created_at": "2026-10-07T11:05:00Z",
+                        "body": "A first answer.",
+                        "is_answer": True,
+                        "reactions": {"+1": 2, "-1": 1},
+                    }
+                ],
             }
         ],
     ),
@@ -730,7 +850,7 @@ def test_every_graphql_document_of_the_script_is_checked(monkeypatch, schema):
         for request in REQUESTS.values()
         for sent in send(monkeypatch, schema, request)[1]
     }
-    assert len(documents) == 16
+    assert len(documents) == 18
     assert documents == checked
 
 

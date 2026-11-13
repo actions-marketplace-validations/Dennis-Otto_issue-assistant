@@ -157,6 +157,17 @@ def tag(name: str, attributes: dict[str, str]) -> str:
     return f"<{name} {pairs}>"
 
 
+# The folder of the pages of a further language on the website, such as de/, and the
+# path of a picture inside it.
+LANGUAGE_FOLDER = re.compile(
+    r"(?P<language>[a-z]{2}(?:[-_][A-Za-z]{2,4})*)/(?P<rest>.+)"
+)
+# The address of a picture that a page gives itself, relative to the page.
+RELATIVE = re.compile(
+    r'\b(?P<attribute>src|srcset)="(?P<address>[^":/\s,#?]+(?:/[^":/\s,#?]+)*)"'
+)
+
+
 def localized(html: str, url: str, docs: Path) -> str:
     """The HTML of the page at url, with the pictures of the website.
 
@@ -168,11 +179,48 @@ def localized(html: str, url: str, docs: Path) -> str:
         path = posixpath.relpath(match["path"], folder)
         return f'{match["attribute"]}="{path}"'
 
+    def own(target: str) -> Path | None:
+        """The picture in its language that the i18n plugin serves at target.
+
+        A page of a further language, such as de/index.html, finds in its folder
+        only the pictures of docs/ in that language, such as images/NAME.de.png as
+        de/images/NAME.png.
+        """
+        language = LANGUAGE_FOLDER.fullmatch(target)
+        if not language or (docs / target).exists():
+            return None
+        stem, dot, ending = language["rest"].rpartition(".")
+        path = docs / f"{stem}.{language['language']}{dot}{ending}"
+        return path if path.exists() else None
+
+    def served(match: re.Match[str]) -> str:
+        """The address of a picture that the website serves.
+
+        A picture of the default language that a page of a further language shows,
+        written as on the English page, images/NAME.png, is the one of the default
+        language, ../images/NAME.png: the i18n plugin doesn't copy it into de/.
+        """
+        address = match["address"]
+        target = posixpath.normpath(posixpath.join(folder, address))
+        language = LANGUAGE_FOLDER.fullmatch(target)
+        # A diagram stays as it is: the hook of the blueprint draws it from its
+        # source, whatever path the page gives it.
+        diagram = address.endswith(".svg")
+        if (
+            language
+            and not diagram
+            and not (docs / target).exists()
+            and not own(target)
+        ):
+            address = posixpath.relpath(language["rest"], folder)
+        return f'{match["attribute"]}="{address}"'
+
     def dimensions(address: str) -> dict[str, str]:
         """The width and height of the picture at an address relative to the page."""
         if "://" in address or address.startswith(("/", "data:")):
             return {}
-        width, height = size(docs / posixpath.normpath(posixpath.join(folder, address)))
+        target = posixpath.normpath(posixpath.join(folder, address))
+        width, height = size(own(target) or docs / target)
         return {"width": str(width), "height": str(height)}
 
     def themed(match: re.Match[str]) -> str:
@@ -215,7 +263,7 @@ def localized(html: str, url: str, docs: Path) -> str:
             copies.append(f"<picture>{sources}{tag('img', attributes)}</picture>")
         return "".join(copies)
 
-    return PICTURE.sub(themed, ADDRESS.sub(local, html))
+    return PICTURE.sub(themed, RELATIVE.sub(served, ADDRESS.sub(local, html)))
 
 
 def scrolling(output: str) -> str:
@@ -352,8 +400,10 @@ MORE_LANGUAGES = {"zh": "中文", "ja": "日本語", "ru": "Русский"}
 DEMO = "demo-org/plant-monitor"
 # The related repository of the demo project, in [related] of its config.toml.
 FIRMWARE = "demo-org/plant-hub-firmware"
-REPORTER = "alex-demo"
-MAINTAINER = "sam-demo"
+# The people of the demo project. GitHub lets no one register a name with an
+# underscore, so these name no one's account, as a name such as alex-demo would.
+REPORTER = "alex_demo"
+MAINTAINER = "sam_demo"
 # The days after the closing that the example of a locked issue names; the default
 # of lock_closed_after_days, 0, locks none.
 LOCK_EXAMPLE = 90
@@ -723,6 +773,12 @@ KINDS = {
         "A merged pull request that names the issue with `Fixes #42` marks it "
         "`fixed-in-next-release`. The issue stays open until a release ships the fix.",
     ),
+    "implemented": (
+        "Implemented by a pull request",
+        "A feature request, an issue with the label `enhancement` or the issue type "
+        "Feature and without the label `bug`, had no problem to fix: the notice of "
+        "the merge says what the pull request implemented instead.",
+    ),
     "released": (
         "Released",
         "When a release ships the fix, the issue closes with a link to the release and "
@@ -735,6 +791,16 @@ KINDS = {
         "after the release, so the comment promises no reopening: a comment of the "
         "reporter gives the issue `needs-triage`, at any time, and the digest lists it "
         "for the maintainers until one answers.",
+    ),
+    "released-feature": (
+        "Released, on a feature request",
+        "A feature request hears how to use what it asked for, and that a comment "
+        "within {reopen_after_release} days reopens it when something is missing.",
+    ),
+    "released-feature-muted": (
+        "Released, on a muted feature request",
+        "On a muted feature request, the comment asks the reporter to write for the "
+        "maintainers when something is missing, as on any muted issue.",
     ),
     "reopened-release": (
         "Reopened after the release",
@@ -797,11 +863,15 @@ ALERTS = {
     "WARNING": "warning",
     "CAUTION": "danger",
 }
+# A link to the demo project or to its firmware, which exist nowhere.
 DEMO_LINK = re.compile(
-    rf'<a href="https://github\.com/{re.escape(DEMO)}[^"]*">(?P<text>.*?)</a>', re.S
+    rf'<a href="https://github\.com/(?:{re.escape(DEMO)}|{re.escape(FIRMWARE)})'
+    r'[^"]*">(?P<text>.*?)</a>',
+    re.S,
 )
+# A mention, also of the people of the demo project, whose names have an underscore.
 MENTION = re.compile(
-    r"(?<![\w@/.-])@(?P<login>[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
+    r"(?<![\w@/.-])@(?P<login>[A-Za-z0-9](?:[\w-]*[A-Za-z0-9])?)", re.ASCII
 )
 # A reference to an issue, which GitHub links; not the anchor of an address.
 REFERENCE = re.compile(r"(?<![\w&/#])#(?P<number>\d+)\b")
@@ -976,7 +1046,14 @@ def comments(ia: ModuleType, config: Any, language: str) -> dict[str, str]:
         ),
         "closed-duplicate": ia.render_closed_duplicate(23, language),
         "fixed": ia.render_fixed(43, "main", language),
+        "implemented": ia.render_fixed(43, "main", language, feature=True),
         "released": ia.render_released(REPORTER, release, [43], language),
+        "released-feature": ia.render_released(
+            REPORTER, release, [43], language, feature=True
+        ),
+        "released-feature-muted": ia.render_released(
+            REPORTER, release, [43], language, muted=True, feature=True
+        ),
         "released-muted": ia.render_released(
             REPORTER, release, [43], language, muted=True
         ),
