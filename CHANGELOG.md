@@ -4,6 +4,20 @@ All notable changes of the issue assistant. The complete notes of every version,
 
 ## Unreleased
 
+## [1.14.0](https://github.com/Dennis-Otto/issue-assistant/compare/v1.13.3...v1.14.0) (2026-11-17)
+
+### Features
+
+- A repository whose own workflow dismisses the accepted alerts of its pull requests can now keep Findings for the scans of `main`: with `pull_requests = false` under `[findings]` in `config.toml`, `install` writes `findings.yml` with `branches: [main]` under `workflow_run`, and `check` expects it, fails while no other workflow calls `reusable-findings.yml` on `workflow_run`, and fails when the default branch isn't `main`.
+- A repository whose release workflow starts the sweep itself, with `gh workflow run issue-lifecycle.yml -f dry_run=false` after it published a release, can now leave out the start of Issue lifecycle after every run of `Release`: with `sweep_after_release_workflow = false` under `[releases]` in `config.toml`, `install` writes `issue-lifecycle.yml` without that start, and `check` expects it. *From the fix to the release* says how each kind of release workflow starts the sweep.
+- Nothing changes for a repository without these keys, and it needs no `install` for this release; one that sets a key runs `install` again.
+
+## [1.13.3](https://github.com/Dennis-Otto/issue-assistant/compare/v1.13.2...v1.13.3) (2026-11-17)
+
+### Bug fixes
+
+* **deps:** update the Copilot CLI to 1.0.108 (was 1.0.107) ([#450](https://github.com/Dennis-Otto/issue-assistant/issues/450)) ([28ddd04](https://github.com/Dennis-Otto/issue-assistant/commit/28ddd0477aaf7a6562922a78d7109fb7cec27dff))
+
 ## [1.13.2](https://github.com/Dennis-Otto/issue-assistant/compare/v1.13.1...v1.13.2) (2026-11-16)
 
 ### Bug fixes
