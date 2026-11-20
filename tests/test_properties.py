@@ -13,6 +13,7 @@ import dataclasses
 import json
 import re
 import unicodedata
+from unittest import mock
 
 import hypothesis
 import pytest
@@ -20,7 +21,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 import issue_assistant as assistant
-from oracle import PARSER, headings, problems
+from issue_assistant import markup
+from oracle import PARSER, browser_text, headings, hides_the_rest, problems
 from support import (
     BOT_USER,
     BOX,
@@ -721,18 +723,95 @@ HTML_TEXT = st.lists(
 
 
 def shown(text):
-    """What GitHub shows of a text: all of it, but nothing after a line that starts
-    with a `<!--` that no `-->` follows. The earlier pattern left such a comment as
-    text; now it hides the rest, as GitHub does."""
-    for line in re.finditer(r"^ {0,3}<!--", text, re.MULTILINE):
-        if "-->" not in text[line.start() :]:
-            return text[: line.start()]
-    return text
+    """What GitHub shows of a text: all of it up to where an HTML block holds a
+    `<!--` that no `-->` follows, without the tags that run past their rows. The
+    earlier pattern left such a comment and such a tag as text; now both go, as
+    GitHub hides them. Where they go,
+    test_the_engine_reads_nothing_that_an_html_block_hides holds against a CommonMark
+    parser and a browser's reading of its HTML."""
+    spans, _, end = assistant.html_parts(text)
+    return assistant.without(text, spans, 0, end)
 
 
+# The earlier pattern, and an instruction, a declaration or a section of CDATA that
+# ends on its row at its first `>`, which the earlier pattern left as text, and
+# which GitHub hides wherever it stands outside code.
+EARLIER_HTML_AND_MARKUP = re.compile(
+    rf"{EARLIER_HTML.pattern}|<(?:\?[^<>\r\n]*\?|![A-Za-z][^<>\r\n]*"
+    r"|!\[CDATA\[[^<>\r\n]*\]\])>",
+    re.DOTALL,
+)
+
+
+@hypothesis.example("<!a>")
 @given(HTML_TEXT)
 def test_html_is_removed_as_it_always_was(text):
-    assert assistant.strip_html(text) == EARLIER_HTML.sub("", shown(text))
+    assert assistant.strip_html(text) == EARLIER_HTML_AND_MARKUP.sub("", shown(text))
+
+
+# Rows of HTML blocks and of the tags that run over them, at the top of the text, in
+# quotes and in list items, with what starts a value or ends a tag, and with each
+# kind of line break.
+TAG_ROWS = st.tuples(
+    st.lists(
+        st.sampled_from(
+            [
+                "<div",
+                "<DIV a",
+                "</p",
+                "<td\tb",
+                "<pre>",
+                "<a>",
+                "<!--",
+                "-->",
+                "<?",
+                "<!X",
+                "```",
+                "x",
+                "a b",
+                "",
+                " ",
+                "\t",
+                ">",
+                "> ",
+                "> <div",
+                "> x",
+                ">> x",
+                "> > <p",
+                "- <div",
+                "  x",
+                "    <div",
+                "=",
+                "a=",
+                "'",
+                '"',
+                "b c='d'",
+                "x >",
+            ]
+        ),
+        max_size=30,
+    ),
+    st.sampled_from(["\n", "\r\n", "\r"]),
+).map(lambda rows: rows[1].join(rows[0]))
+
+
+@hypothesis.example("<div\nx\n\n<DIV a\n \n\t\n<td\tb\n\n<div\n<a>\n\n</p\nb c='d'")
+@hypothesis.example("<div\r\n\r\n<p\r\nx\r\n\r\n> <div\r\n\r\n<div a=")
+@hypothesis.example("> <div\n> x\n>> x\n> > <p\n\n> <div\n> a b\n> x >\nx")
+@hypothesis.example("> > <p\n> x\n>> a b\n> a=\n> > <p\n>\n> x")
+@hypothesis.example("<div\nx\n\n<div\ny\n\nz")
+@hypothesis.example("> <div\n> a=\n> 'x\n> y\nz")
+@given(TAG_ROWS)
+def test_the_rows_read_in_bulk_read_as_one_at_a_time(text):
+    """The searches that read many rows of a tag at once find what the reading of a
+    row at a time finds, which reads them where the searches match nothing."""
+    bulk = assistant.html_parts(text)
+    nothing = re.compile("")
+    with (
+        mock.patch.object(markup, "TAG_BLOCKS", nothing),
+        mock.patch.object(markup, "inert_rows", lambda shallow, depth: nothing),
+    ):
+        assert assistant.html_parts(text) == bulk
 
 
 # Pieces of a text that would pass for the structure of issue.md: a heading of the
@@ -846,6 +925,30 @@ DEFINITIONS = st.lists(
 @hypothesis.example(" ```\n```\n[x]: # (hidden)")
 @hypothesis.example('[x]: #\n"hidden\n2. hidden"')
 @hypothesis.example('x\n\n[a]: <> "[^x]"\n\n[^x]: hidden')
+# What the long search found (2026-11-20): what GitHub shows as a heading or as
+# text, where markdown-it reads a definition; texts on which markdown-it-py 4.3.0
+# raises an IndexError; definitions over a lazy line, after indented code and
+# after HTML in a quote, which GitHub hides; footnotes whose only reference stands
+# in code or HTML that the cleaning can't follow, which GitHub hides; and one with
+# a reference that markdown-it leaves as text.
+@hypothesis.example("[^0]:0\n>~~~[^0]")
+@hypothesis.example("[^0]:0\n<A>~~~[^0]")
+@hypothesis.example("[^0]:-->0\n```\n[^0]")
+@hypothesis.example("><!A[^0]\n[^0]:0")
+@hypothesis.example("[^0]:0\n\n[^0][0]")
+@hypothesis.example("[0]:\n=")
+@hypothesis.example('[x]:\n=\n"hidden"')
+@hypothesis.example("[0]:\n--")
+@hypothesis.example('[0]: /u "a\n=\nb"')
+@hypothesis.example("[a\nb]:\n=")
+@hypothesis.example("[0]:\\\t0")
+@hypothesis.example(">- <!A\n>")
+@hypothesis.example("> - <!--\n>")
+@hypothesis.example('> [0]:\n=\n"hidden"')
+@hypothesis.example('> [0]:\n--\n"hidden"')
+@hypothesis.example('- [0]:\n=\n"hidden"')
+@hypothesis.example('    >0\n[0]: /u "hidden words"\n\n[0]')
+@hypothesis.example('><!A\n[0]: /u "hidden words"\n\n[0]')
 @given(st.one_of(st.text(), STRUCTURE, DEFINITIONS))
 def test_a_commonmark_parser_finds_no_definition_in_what_the_engine_reads(text):
     """What is left of a text after the definitions went holds none, as a CommonMark
@@ -867,11 +970,20 @@ def test_a_commonmark_parser_finds_no_definition_in_what_the_engine_reads(text):
     assert subsequence(shown, assistant.strip_html(text))
 
 
+FOOTNOTE_IN_TEXT = re.compile(r"\[\^[^\]\s]+\]")
+
+
 def references(tokens):
-    """The text of each link and image, as the parser writes the label of one."""
+    """The text of each link and image, as the parser writes the label of one, and
+    each footnote reference that it leaves as text: GitHub shows `[^1][x]` as a
+    reference to the footnote when nothing defines `x`. An escape is a token of its
+    own, so a bracket in a text token is none."""
     for token in tokens:
         text = None
         for child in token.children or ():
+            if child.type == "text" and text is None:
+                for match in FOOTNOTE_IN_TEXT.finditer(child.content):
+                    yield match[0][1:-1].upper()
             if child.type == "link_open":
                 text = ""
             elif child.type == "link_close":
@@ -895,6 +1007,95 @@ def test_the_engine_reads_no_text_that_github_hides(text):
     inner = rest[: rest.rfind("\n" + marks)]
     assert subsequence(inner, assistant.shown_text(text)[0])
     assert not assistant.INVISIBLE.search(inner)
+
+
+# Text made of the pieces of HTML blocks, of the quotes and list items that may hold
+# them, and of what keeps a row from starting one.
+HTML_BLOCKS = st.lists(
+    st.sampled_from(
+        [
+            "<!--",
+            "-->",
+            "<div>",
+            "</p>",
+            "<pre>",
+            "</pre>",
+            "<?",
+            "?>",
+            "<!X",
+            "<![CDATA[",
+            "]]>",
+            "<b>",
+            "<x-y>",
+            "<span>",
+            ">",
+            "> ",
+            "- ",
+            "* ",
+            "1. ",
+            "2) ",
+            "[ ] ",
+            "  ",
+            "    ",
+            "\t",
+            " ",
+            "\n",
+            "\n\n",
+            "x",
+            "```",
+            '<a title=">">',
+            '"',
+            "'",
+            "--!>",
+            "[^1]: ",
+            "<https://x>",
+            "<div",
+            "<a",
+            "</div",
+            "<pre",
+            " t=",
+            "=",
+            "Plugh",
+        ]
+    ),
+    max_size=30,
+).map("".join)
+
+
+@hypothesis.example("x\n\n> <!--\n> a")
+@hypothesis.example("> x\n> <!--\n> a")
+@hypothesis.example("> - <!--\nx")
+@hypothesis.example("- a\n  - b\n    <!--")
+@hypothesis.example("<div>\n> x <!--")
+@hypothesis.example("> <pre>\n<?\n</pre>\nx <!--")
+@hypothesis.example("<!-- a --> <!--")
+@hypothesis.example("<div\nPlugh\n")
+@hypothesis.example("> <a t=\n> Plugh>")
+@hypothesis.example("<pre")
+@given(st.one_of(STRUCTURE, HTML_BLOCKS))
+def test_the_engine_reads_nothing_that_an_html_block_hides(text):
+    """Nothing after an HTML block that holds a `<!--` that no `-->` follows reaches
+    the engine, wherever a CommonMark parser finds the block: GitHub shows none of
+    it. Nor does a word of a tag that runs over several rows, or of an instruction,
+    a declaration or a section of CDATA, as a browser reads the HTML of a CommonMark
+    parser, in a text without comments, which tests of their own judge, and outside
+    code, whose language a browser doesn't show. And without a `<!--`, a quote, a
+    tag or such markup over rows, which alone can hide it, nothing ends the text
+    early."""
+    text += "\n\nXyzzy"
+    shown = assistant.shown_text(text)[0]
+    seen = browser_text(text)
+    # A `<!--` in a tag is part of the tag: GitHub showed `zqd` after `<div><div<!--`
+    # and a blank row (`gh api markdown -f mode=gfm`, 2026-11-20).
+    assert not hides_the_rest(text) or "Xyzzy" not in shown or "Xyzzy" in seen
+    if not any(mark in text for mark in ("<!--", "-->", "`")):
+        assert shown.count("Plugh") <= seen.count("Plugh")
+        assert "Xyzzy" in seen or "Xyzzy" not in shown
+    assert (
+        any(mark in text for mark in ("<!--", '"', "'"))
+        or assistant.long_tags(text) != ([], len(text))
+        or "Xyzzy" in shown
+    )
 
 
 # Forms with HTML: headings, answers, comments and tags with attributes.
