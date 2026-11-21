@@ -714,6 +714,87 @@ def test_no_text_before_a_ticked_box_hides_it(body):
     assert assistant.box_ticked(body + BOX.format("X"), CONFIG)
 
 
+# Texts of what the assistant decides from: names of errors, words of a language,
+# answers of the area and of the box, closing keywords with words against them, and
+# the HTML, the link reference definitions and the code that GitHub hides or shows.
+DECIDED = st.lists(
+    st.sampled_from(
+        [
+            "It fails with ImportError.",
+            "Die Karte bleibt leer, und ich weiß nicht, warum das so ist.",
+            "Fixes #12",
+            "This does not close #12",
+            "### Area\n\n",
+            "Live card",
+            "X01 game, Other",
+            "_No response_",
+            "### Automated analysis\n\n",
+            "- [X] Keep the AI out.",
+            "- [ ] Keep the AI out.",
+            "<!--",
+            "-->",
+            "<!-- ZebraError -->",
+            "<?x QuokkaError ?>",
+            '<span data-x="YakError">',
+            "</span>",
+            "[a]: https://example.com/GnuError",
+            "<details>",
+            "</details>",
+            "```",
+            "`TypeError`",
+            "> ",
+            "- ",
+            "\n",
+            "\n\n",
+            " ",
+        ]
+    ),
+    max_size=30,
+).map("".join)
+AREAS = dataclasses.replace(
+    CONFIG,
+    labels=(
+        assistant.Label("area: cards", "c5def5", "Cards", "area", ("Live card",)),
+        assistant.Label("area: games", "c5def5", "Games", "area", ("X01 game",)),
+    ),
+)
+
+
+def decisions(body):
+    """What the assistant decides from a text of the reporter, as the body of an
+    issue and as a comment of its reporter."""
+    issue = make_issue(body=body)
+    return (
+        assistant.search_terms(issue),
+        assistant.issue_language(issue, [make_comment(1, "reporter", body, 0)]),
+        assistant.form_labels(issue, AREAS),
+        assistant.denies_closing(body, REPOSITORY, 12),
+    )
+
+
+@hypothesis.example("Fixes #12\n\n<!-- This does not close #12 -->")
+@hypothesis.example("### Area\n\nLive card\n<!--\n### Area\n\nX01 game\n\n### x\n-->")
+@given(DECIDED)
+def test_what_the_assistant_decides_it_decides_from_what_github_shows(body):
+    """The search, the language, the area and the denial of a fix are the same for
+    a text and for the text that GitHub shows of it; the box of the opt-out is
+    ticked whenever it is ticked in either of them.
+
+    Only where GitHub shows that text as it is: what is left of a text can read as
+    other Markdown, as a `<!--` that a tag before it kept inside a paragraph, which
+    starts a block on a row of its own."""
+    shown = assistant.as_shown(body)
+    hypothesis.assume(assistant.as_shown(shown) == shown)
+    assert decisions(body) == decisions(shown)
+    ticked = [
+        assistant.TICKED_BOX.search(answer) is not None
+        for label, answer in assistant.form_parts(body)[1]
+        if label == CONFIG.opt_out_field
+    ]
+    if any(ticked) or assistant.box_ticked(shown, CONFIG):
+        assert assistant.box_ticked(body, CONFIG)
+
+
 HTML_TEXT = st.lists(
     st.sampled_from(
         ["<", ">", "/", "!", "-", "a", "B", " ", "\n", "<!--", "-->", "<b>", "</i>"]
@@ -812,6 +893,103 @@ def test_the_rows_read_in_bulk_read_as_one_at_a_time(text):
         mock.patch.object(markup, "inert_rows", lambda shallow, depth: nothing),
     ):
         assert assistant.html_parts(text) == bulk
+
+
+# Rows of HTML blocks, and what passes for one: a footnote may hold a `<` in its label
+# before the tag of its row.
+BLOCK_ROWS = st.one_of(
+    TAG_ROWS,
+    HTML_TEXT,
+    st.lists(
+        st.sampled_from(["[^<a]: <div", "[^a]: ", "- ", "> ", "  ", "\t", "<", "x"]),
+        max_size=12,
+    ).map("".join),
+)
+
+
+@hypothesis.example("[^<a]: <div\n\n> - <p\n<")
+@given(BLOCK_ROWS)
+def test_a_row_without_a_tag_start_starts_no_block_as_before(text):
+    """HTML_ROW passes over a row without a `<` at once; without that look ahead,
+    it finds the same rows, with the same marks and kinds."""
+    pattern = markup.HTML_ROW.pattern
+    assert markup.HOLDS_A_TAG_START in pattern
+    earlier = re.compile(pattern.replace(markup.HOLDS_A_TAG_START, "", 1))
+
+    def rows(found):
+        return [(row.span(), row.span("marks"), row.lastgroup) for row in found]
+
+    assert rows(markup.HTML_ROW.finditer(text)) == rows(earlier.finditer(text))
+
+
+class EarlierBlocks:
+    """Blocks.holding as it read up to 2026-11-21: a block made for each row that may
+    start one, of which the latest of each kind is kept until it ends."""
+
+    def __init__(self, text, fenced):
+        rows = markup.HtmlRows(text)
+        self.found, self.lists = rows.found(), rows.lists()
+        self.blocks = markup.Blocks(text, rows)
+        self.fences = markup.Fences(text, rows) if fenced else None
+        self.index, self.latest = 0, {}
+
+    def holding(self, position):
+        while (
+            self.index < len(self.found) and self.found[self.index].start() <= position
+        ):
+            row = self.found[self.index]
+            self.index += 1
+            marks = row["marks"]
+            if (row.start() >= self.lists or not marks or not markup.code(marks)) and (
+                self.fences is None or not self.fences.holds(row.start())
+            ):
+                kind = row.lastgroup
+                key = (
+                    kind
+                    if kind == "comment" or kind in markup.HTML_ENDS
+                    else min(marks.count(">"), len(markup.BLANK_ROWS) - 1)
+                )
+                self.latest[key] = markup.Block(row, self.latest.get(key))
+        for key, block in list(self.latest.items()):
+            if self.blocks.end(block.row) <= position:
+                del self.latest[key]
+        return list(self.latest.values())
+
+
+def chains(blocks):
+    """Each block as the start of its row and of the rows of the blocks before it."""
+    found = []
+    for block in blocks:
+        starts = []
+        while block is not None:
+            starts.append(block.row.start())
+            block = block.earlier
+        found.append(starts)
+    return found
+
+
+@hypothesis.example(
+    ("<div\n<div\n\n<a>\n> <p\n\n<!--\n<p\n\n<?", [0, 0, 5, 30, 31]), False
+)
+@hypothesis.example(("```\n<div\n```\n<div\n<p\n\n<a>", [4, 13, 18, 25]), True)
+@given(
+    BLOCK_ROWS.flatmap(
+        lambda text: st.tuples(
+            st.just(text), st.lists(st.integers(0, len(text)), max_size=8).map(sorted)
+        )
+    ),
+    st.booleans(),
+)
+def test_the_blocks_that_hold_a_position_are_as_before(case, fenced):
+    """Blocks.holding, which makes no block of a kind whose last block has ended,
+    finds the same blocks, each within the same blocks before it, in the same order,
+    as when it made a block for each row."""
+    text, positions = case
+    rows = markup.HtmlRows(text)
+    blocks = markup.Blocks(text, rows, markup.Fences(text, rows) if fenced else None)
+    earlier = EarlierBlocks(text, fenced)
+    for position in positions:
+        assert chains(blocks.holding(position)) == chains(earlier.holding(position))
 
 
 # Pieces of a text that would pass for the structure of issue.md: a heading of the
